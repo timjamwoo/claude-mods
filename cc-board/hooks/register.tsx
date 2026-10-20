@@ -4,24 +4,28 @@
 //   - keeps this session's checklist (TodoWrite items + manual steps) in $.state
 //   - writes it to ~/.claude/board/<session-id>.json after every change
 //   - polls that folder and draws every live session in the band above the prompt
-//   - optionally mirrors the same document to a secret GitHub gist (one file per
+//   - optionally mirrors the same document to a Supabase table (one row per
 //     session), so sessions on other machines and in the cloud share one board
 //   - draws the checklist as buttons in a pane, and tells Claude what you ticked
 //
 // Every helper that takes `$` is a top-level function: `claude plugin validate`
 // follows `$` only into those.
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, Register, Timer } from 'claude-code'
+import type { EngineInterface, PluginOptions, Register, RenderSurface, Timer } from 'claude-code'
 
 import type { BoardSession, Checklist, ChecklistItem } from '../types'
 import {
   EMPTY_CHECKLIST,
+  addFollowUp,
   addManual,
   applyTaskEvent,
+  cueExcerpts,
   describeChanges,
+  hasLooseEndCue,
   mergeTodos,
   openItems,
   parseItemId,
+  parseFollowUpLines,
   parseManualLines,
   reconcile,
   seedFromTranscript,
@@ -44,8 +48,10 @@ import {
   parse,
   serialize,
   sortSessions,
+  sourceTag,
+  STALE_AFTER_MS,
 } from './board'
-import { gistFileName, gistHeaders, gistPatchBody, gistUrl, parseGistFiles } from './gist'
+import { deleteBeforeUrl, deleteUrl, parseRows, readUrl, sharedHeaders, tableUrl, upsertBody, upsertHeaders } from './shared'
 
 const PANE = 'cc-board'
 const POLL_MS = 2000
@@ -61,21 +67,22 @@ const board = atom({ plugin: 'cc-board', key: 'board' } as const, [])
 // ---- Module state (a hot reload resets it; session.start refills it) ------
 
 let useHaiku = true
+let useFollowUps = true
 let pluginOptions: PluginOptions = {}
 
 let sessionId = ''
 let cwd = ''
 let project = ''
 let machine = ''
+let tty = ''
 let boardDir = ''
 
-// The shared gist, when configured. `remoteEtag` makes unchanged polls free.
-let gistId = ''
-let gistToken = ''
-let remoteEtag = ''
+// The shared table, when configured.
+let boardUrl = ''
+let boardKey = ''
 let remoteFailures = 0
 let pushTimer: Timer | undefined
-let pendingPush = ''
+let pendingPush: BoardSession | undefined
 let lastPushed = ''
 
 // What the summary is derived from.
@@ -92,12 +99,12 @@ let flushTimer: Timer | undefined
 // The board files as last read: name -> mtime, and name -> parsed session.
 const seenMtime = new Map<string, number>()
 const sessions = new Map<string, BoardSession>()
-// The gist's sessions as last read, by file name.
+// The shared table's sessions as last read, by session id.
 const remoteSessions = new Map<string, BoardSession>()
 let boardSignature = ''
 
 function isRemoteConfigured(): boolean {
-  return gistId !== '' && gistToken !== ''
+  return boardUrl !== '' && boardKey !== ''
 }
 
 function log($: EngineInterface, text: string): void {
@@ -121,6 +128,7 @@ async function writeBoardFile($: EngineInterface, endedAt?: string): Promise<voi
     }
     if (endedAt !== undefined) snapshot.endedAt = endedAt
     if (machine !== '') snapshot.machine = machine
+    if (tty !== '') snapshot.tty = tty
 
     // $.fs.write is not atomic, so write a temp file and rename it into place.
     const target = fileFor(boardDir, sessionId)
@@ -129,7 +137,7 @@ async function writeBoardFile($: EngineInterface, endedAt?: string): Promise<voi
     const moved = await $.process.run(['mv', '-f', temp, target], { timeoutMs: 5000 })
     if (moved.exitCode !== 0) log($, `mv failed: ${moved.stderr}`)
     await refreshBoard($)
-    schedulePush($, serialize(snapshot), endedAt !== undefined)
+    schedulePush($, snapshot, endedAt !== undefined)
   } catch (error) {
     log($, `board write failed: ${String(error)}`)
   }
@@ -187,16 +195,87 @@ async function publishBoard($: EngineInterface, changed: boolean): Promise<void>
   if (changed) await update($, board, () => merged)
 }
 
-// ---- Shared board in a gist -----------------------------------------------
+// ---- Shared board in a Supabase table --------------------------------------
 
 async function configureRemote($: EngineInterface): Promise<void> {
   const option = (name: string) => {
     const value = pluginOptions[name]
     return typeof value === 'string' ? value.trim() : ''
   }
-  gistId = option('boardGist') || ((await $.env.get('CC_BOARD_GIST')) ?? '').trim()
-  gistToken = option('boardToken') || ((await $.env.get('CC_BOARD_TOKEN')) ?? '').trim()
-  if (gistId !== '' && gistToken === '') log($, 'boardGist is set but no token: the board stays local')
+  boardUrl = option('boardUrl') || ((await $.env.get('CC_BOARD_URL')) ?? '').trim()
+  boardKey = option('boardKey') || ((await $.env.get('CC_BOARD_KEY')) ?? '').trim()
+  if (boardUrl !== '' && boardKey === '') log($, 'boardUrl is set but no key: the board stays local')
+}
+
+/** The terminal this session runs in, as /dev/ttysNNN, or '' when it has none (the desktop app, a cloud session). */
+async function detectTty($: EngineInterface): Promise<string> {
+  try {
+    const found = await $.process.run(['sh', '-c', 'ps -o tty= -p $PPID'], { timeoutMs: 3000 })
+    const name = found.stdout.trim()
+    if (found.exitCode !== 0 || name === '' || name === '?' || name === '??') return ''
+    return name.startsWith('/dev/') ? name : `/dev/${name}`
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Brings the terminal tab of a session on this machine to the front, through
+ * Terminal.app then iTerm2. Resolves false when neither holds that tty.
+ */
+async function raiseTerminal($: EngineInterface, target: string): Promise<boolean> {
+  const scripts = [
+    `tell application "Terminal"
+      repeat with w in windows
+        repeat with t in tabs of w
+          if tty of t is "${target}" then
+            set selected tab of w to t
+            set index of w to 1
+            activate
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end tell
+    return "none"`,
+    `tell application "iTerm2"
+      repeat with w in windows
+        repeat with t in tabs of w
+          repeat with s in sessions of t
+            if tty of s is "${target}" then
+              select t
+              select s
+              activate
+              return "ok"
+            end if
+          end repeat
+        end repeat
+      end repeat
+    end tell
+    return "none"`,
+  ]
+  for (const script of scripts) {
+    try {
+      const ran = await $.process.run(['osascript', '-e', script], { timeoutMs: 8000 })
+      if (ran.exitCode === 0 && ran.stdout.trim() === 'ok') return true
+    } catch (error) {
+      log($, `osascript failed: ${String(error)}`)
+    }
+  }
+  return false
+}
+
+/** What a click on a board line does: raise that session's terminal, or copy how to get back to it. */
+async function switchToSession($: EngineInterface, target: BoardSession, surface: RenderSurface): Promise<void> {
+  if (target.sessionId === sessionId) {
+    $.ui.toast('that is this session')
+    return
+  }
+  if (target.tty !== undefined && target.machine === machine && (await raiseTerminal($, target.tty))) return
+  const command = `cd ${target.cwd} && claude --resume ${target.sessionId}`
+  const copied = await $.ui.copy({ text: command, surface }).catch(() => ({ isCopied: false as const, reason: 'failed' }))
+  const where = target.machine !== undefined && target.machine !== machine ? ` (it runs on ${target.machine})` : ''
+  $.ui.toast(copied.isCopied ? `resume command copied${where}` : `resume with: ${command}`)
 }
 
 /** A short label for where this session runs: "cloud", or the host name. */
@@ -214,14 +293,14 @@ async function detectMachine($: EngineInterface): Promise<string> {
 
 function remoteFailed($: EngineInterface, what: string, status: number | string): void {
   remoteFailures += 1
-  log($, `gist ${what} failed: ${status}`)
+  log($, `shared board ${what} failed: ${status}`)
   if (remoteFailures === 1) $.ui.toast(`shared board: ${what} failed (${status}), see the debug log`)
 }
 
-/** Writes this session's file to the gist, a little after the last local write, and only when it changed. */
-function schedulePush($: EngineInterface, text: string, atOnce: boolean): void {
+/** Writes this session's row, a little after the last local write, and only when it changed. */
+function schedulePush($: EngineInterface, snapshot: BoardSession, atOnce: boolean): void {
   if (!isRemoteConfigured()) return
-  pendingPush = text
+  pendingPush = snapshot
   pushTimer?.cancel()
   if (atOnce) {
     void pushRemote($)
@@ -231,16 +310,13 @@ function schedulePush($: EngineInterface, text: string, atOnce: boolean): void {
 }
 
 async function pushRemote($: EngineInterface): Promise<void> {
-  if (!isRemoteConfigured() || pendingPush === '' || pendingPush === lastPushed) return
-  const text = pendingPush
+  if (!isRemoteConfigured() || pendingPush === undefined) return
+  const body = upsertBody(pendingPush)
+  if (body === lastPushed) return
   try {
-    const response = await $.http.fetch(gistUrl(gistId), {
-      method: 'PATCH',
-      headers: { ...gistHeaders(gistToken), 'content-type': 'application/json' },
-      body: gistPatchBody({ [gistFileName(sessionId)]: text }),
-    })
+    const response = await $.http.fetch(tableUrl(boardUrl), { method: 'POST', headers: upsertHeaders(boardKey), body })
     if (response.ok) {
-      lastPushed = text
+      lastPushed = body
       remoteFailures = 0
     } else {
       remoteFailed($, 'write', response.status)
@@ -253,36 +329,38 @@ async function pushRemote($: EngineInterface): Promise<void> {
 async function pullRemote($: EngineInterface): Promise<void> {
   if (!isRemoteConfigured()) return
   try {
-    const response = await $.http.fetch(gistUrl(gistId), { headers: gistHeaders(gistToken, remoteEtag) })
-    if (response.status === 304) return
+    const response = await $.http.fetch(readUrl(boardUrl), { headers: sharedHeaders(boardKey) })
     if (!response.ok) {
       remoteFailed($, 'read', response.status)
       return
     }
-    remoteEtag = response.headers['etag'] ?? ''
     remoteFailures = 0
     remoteSessions.clear()
-    for (const session of parseGistFiles(response.text)) remoteSessions.set(gistFileName(session.sessionId), session)
+    for (const session of parseRows(response.text)) remoteSessions.set(session.sessionId, session)
     await publishBoard($, true)
   } catch (error) {
     remoteFailed($, 'read', String(error))
   }
 }
 
-/** Deletes the named files from the gist. Resolves false when the request failed. */
-async function deleteRemote($: EngineInterface, names: readonly string[]): Promise<boolean> {
-  if (!isRemoteConfigured() || names.length === 0) return true
-  const files: Record<string, null> = {}
-  for (const name of names) files[name] = null
+/**
+ * Deletes the named sessions' rows, and every row older than the stale line,
+ * which reaches rows a capped read never returned. False when a request failed.
+ */
+async function deleteRemote($: EngineInterface, sessionIds: readonly string[], beforeIso: string): Promise<boolean> {
+  if (!isRemoteConfigured()) return true
+  const urls = [deleteBeforeUrl(boardUrl, beforeIso)]
+  if (sessionIds.length > 0) urls.push(deleteUrl(boardUrl, sessionIds))
   try {
-    const response = await $.http.fetch(gistUrl(gistId), {
-      method: 'PATCH',
-      headers: { ...gistHeaders(gistToken), 'content-type': 'application/json' },
-      body: gistPatchBody(files),
-    })
-    if (!response.ok) remoteFailed($, 'prune', response.status)
-    else for (const name of names) remoteSessions.delete(name)
-    return response.ok
+    for (const url of urls) {
+      const response = await $.http.fetch(url, { method: 'DELETE', headers: sharedHeaders(boardKey) })
+      if (!response.ok) {
+        remoteFailed($, 'prune', response.status)
+        return false
+      }
+    }
+    for (const id of sessionIds) remoteSessions.delete(id)
+    return true
   } catch (error) {
     remoteFailed($, 'prune', String(error))
     return false
@@ -424,6 +502,79 @@ async function addManualLines($: EngineInterface, text: string): Promise<number>
   return count
 }
 
+// ---- Loose ends -------------------------------------------------------------
+
+/**
+ * Asks Haiku which loose ends `text` mentions (things to do later, by hand,
+ * or not yet done), skipping what the checklist already holds. Resolves the
+ * new lines, or none.
+ */
+async function extractFollowUps($: EngineInterface, text: string): Promise<string[]> {
+  const list = await read($, checklist)
+  const open = list.items.filter(item => item.status !== 'completed').map(item => `- ${item.text}`).join('\n')
+  try {
+    const reply = await $.model.complete({
+      model: 'haiku',
+      system:
+        'You keep a checklist for a developer so small things said in passing are not forgotten. Read the exchange and list only concrete actions a person still has to do: something to do by hand or outside this conversation (a portal, a key, a certificate, a store listing, a release, a config), something deferred or skipped for now, or something asked for and not done. Skip what the assistant says it will do next, skip advice and hypotheticals, skip anything finished, and skip anything already on the checklist. One per line, imperative, at most twelve words, at most three lines, no numbering, no commentary. If there is nothing, reply NONE.',
+      prompt: `Already on the checklist:\n${open === '' ? '(nothing)' : open}\n\nExchange:\n${cueExcerpts(text)}`,
+      maxTokens: 160,
+      effort: 'low',
+      timeoutMs: 10000,
+    })
+    if (!reply.isAnswered) {
+      log($, `loose-end scan skipped: ${reply.reason}`)
+      return []
+    }
+    return parseFollowUpLines(reply.text)
+  } catch (error) {
+    log($, `loose-end scan failed: ${String(error)}`)
+    return []
+  }
+}
+
+const SCAN_CHUNK_MESSAGES = 16
+const SCAN_MAX_CALLS = 8
+
+/**
+ * Reads a whole conversation for loose ends, newest first, in chunks of
+ * messages, with at most SCAN_MAX_CALLS model calls. Chunks with no cue
+ * phrase cost nothing. Resolves how many loose ends were new.
+ */
+async function scanTranscript($: EngineInterface, messages: readonly { role: 'user' | 'assistant'; text: string }[]): Promise<number> {
+  if (!useFollowUps) return 0
+  let found = 0
+  let calls = 0
+  for (let end = messages.length; end > 0 && calls < SCAN_MAX_CALLS; end -= SCAN_CHUNK_MESSAGES) {
+    const chunk = messages.slice(Math.max(0, end - SCAN_CHUNK_MESSAGES), end)
+    const text = chunk.map(message => `${message.role === 'user' ? 'User' : 'Claude'}: ${cleanPrompt(message.text)}`).join('\n\n')
+    if (!hasLooseEndCue(text)) continue
+    calls += 1
+    found += await surfaceFollowUps($, text)
+  }
+  if (found > 0) await writeBoardFile($)
+  return found
+}
+
+/** Adds the loose ends found in `text` to the checklist and tells Claude. Resolves how many were new. */
+async function surfaceFollowUps($: EngineInterface, text: string): Promise<number> {
+  if (!useFollowUps || !hasLooseEndCue(text)) return 0
+  let count = 0
+  for (const line of await extractFollowUps($, text)) {
+    let added: ChecklistItem | undefined
+    await update($, checklist, (list: Checklist) => {
+      const result = addFollowUp(list, line)
+      added = result.added ? result.item : undefined
+      return result.list
+    })
+    if (added === undefined) continue
+    count += 1
+    queueChange($, { kind: 'followup-added', item: added })
+    $.ui.toast(`loose end #${added.id}: ${clip(added.text, 60)}`)
+  }
+  return count
+}
+
 async function bindSession($: EngineInterface): Promise<void> {
   sessionId = await $.session.id()
   const repo = await $.session.repo().catch(() => null)
@@ -452,9 +603,11 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
           // The file wins (ticks, manual steps, summary), topped up with any task
           // the transcript knows and the file does not, as after an upgrade.
           const nextId = Math.max(0, ...saved.items.map(item => item.id)) + 1
-          const list = reconcile({ items: saved.items, nextId }, await replayTranscript($))
+          const replayed = await replayTranscript($)
+          const list = reconcile({ items: saved.items, nextId }, replayed.list)
           await update($, checklist, () => list)
           await update($, summary, () => saved.summary)
+          if (lastPrompt === '') lastPrompt = replayed.lastPrompt
           return 'file'
         }
       }
@@ -472,6 +625,8 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
     if (list.items.length === 0 && lastPrompt === '') return 'none'
     await update($, checklist, () => list)
     await refreshSummary($, false)
+    // Loose ends mentioned before the mod loaded, anywhere in the conversation.
+    await scanTranscript($, messages)
     return 'transcript'
   } catch (error) {
     log($, `seed from transcript failed: ${String(error)}`)
@@ -479,14 +634,16 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
   }
 }
 
-/** The checklist the transcript implies, or an empty one when it cannot be read. */
-async function replayTranscript($: EngineInterface): Promise<Checklist> {
+/** The checklist the transcript implies and the last prompt a person typed, or empty when it cannot be read. */
+async function replayTranscript($: EngineInterface): Promise<{ list: Checklist; lastPrompt: string }> {
   try {
     const messages = await $.session.messages()
-    return 'deny' in messages ? EMPTY_CHECKLIST : seedFromTranscript(messages)
+    if ('deny' in messages) return { list: EMPTY_CHECKLIST, lastPrompt: '' }
+    const lastUser = [...messages].reverse().find(message => message.role === 'user' && cleanPrompt(message.text) !== '')
+    return { list: seedFromTranscript(messages), lastPrompt: cleanPrompt(lastUser?.text ?? '') }
   } catch (error) {
     log($, `transcript replay failed: ${String(error)}`)
-    return EMPTY_CHECKLIST
+    return { list: EMPTY_CHECKLIST, lastPrompt: '' }
   }
 }
 
@@ -505,8 +662,8 @@ async function registerCommands($: EngineInterface): Promise<void> {
   })
   await $.command.register({
     name: 'board',
-    description: 'Print the board of all sessions; “prune” removes stale ones',
-    argumentHint: '[prune]',
+    description: 'Print the board of all sessions; “prune” removes stale ones, “scan” reads this chat for loose ends',
+    argumentHint: '[prune|scan]',
     immediate: true,
   })
 }
@@ -518,22 +675,33 @@ async function pruneBoard($: EngineInterface): Promise<string> {
   const stale = merged.filter(
     session => session.sessionId !== sessionId && (session.endedAt !== undefined || isStale(session, now)),
   )
-  if (stale.length === 0) return 'cc-board: nothing to prune.'
-  const answer = await $.ui
-    .ask(`Remove ${stale.length} stale or ended session(s) from the board?`, ['Remove', 'Keep'])
-    .catch(() => 'Keep')
-  if (answer !== 'Remove') return 'cc-board: kept everything.'
+  if (stale.length === 0 && !isRemoteConfigured()) return 'cc-board: nothing to prune.'
+  // With a shared board, rows older than the stale line may sit behind the read's cap, unseen.
+  const question =
+    stale.length > 0
+      ? `Remove ${stale.length} stale or ended session(s) from the board?`
+      : 'Nothing stale is listed. Sweep the shared board for rows older than 24 hours anyway?'
+  const answer = await $.ui.ask(question, [stale.length > 0 ? 'Remove' : 'Sweep', 'Keep']).catch(() => 'Keep')
+  if (answer === 'Keep') return 'cc-board: kept everything.'
+  const before = new Date(now - STALE_AFTER_MS).toISOString()
+  if (stale.length === 0) {
+    const swept = await deleteRemote($, [], before)
+    await refreshBoard($)
+    return swept ? 'cc-board: swept the shared board of rows older than 24 hours.' : 'cc-board: the sweep failed, see the debug log.'
+  }
 
-  const names = stale.map(session => gistFileName(session.sessionId))
-  const localPaths = names.filter(name => sessions.has(name)).map(name => `${boardDir}/${name}`)
+  const localPaths = stale
+    .map(session => `${session.sessionId}.json`)
+    .filter(name => sessions.has(name))
+    .map(name => `${boardDir}/${name}`)
   if (localPaths.length > 0) {
     const removed = await $.process.run(['rm', '-f', ...localPaths], { timeoutMs: 5000 })
     if (removed.exitCode !== 0) return `cc-board: rm failed: ${removed.stderr}`
   }
-  const remoteNames = names.filter(name => remoteSessions.has(name))
-  const remoteOk = await deleteRemote($, remoteNames)
+  const remoteIds = stale.map(session => session.sessionId).filter(id => remoteSessions.has(id))
+  const remoteOk = await deleteRemote($, remoteIds, before)
   await refreshBoard($)
-  const where = remoteNames.length > 0 ? ` (${remoteNames.length} from the shared gist${remoteOk ? '' : ', which failed'})` : ''
+  const where = isRemoteConfigured() ? ` (${remoteIds.length} from the shared board${remoteOk ? '' : ', which failed'})` : ''
   return `cc-board: removed ${stale.length} session(s)${where}.`
 }
 
@@ -550,14 +718,14 @@ function itemMark(item: ChecklistItem): string {
 }
 
 function itemLabel(item: ChecklistItem): string {
-  const source = item.source === 'manual' ? ' (manual)' : ''
-  return `${itemMark(item)} #${item.id} ${item.text}${source}`
+  return `${itemMark(item)} #${item.id} ${item.text}${sourceTag(item)}`
 }
 
 // ---- Hooks ----------------------------------------------------------------
 
 export const register: Register = (on, options) => {
   useHaiku = options.haikuSummary !== false
+  useFollowUps = options.followUps !== false
   pluginOptions = options
 
   on('session.start', async ($, e, next) => {
@@ -568,6 +736,7 @@ export const register: Register = (on, options) => {
       boardDir = home === undefined || home === '' ? '' : `${home}/.claude/board`
       if (boardDir === '') log($, 'HOME is unset, so no board file is written')
       machine = await detectMachine($)
+      tty = await detectTty($)
       await configureRemote($)
     } catch (error) {
       log($, `start failed: ${String(error)}`)
@@ -693,6 +862,9 @@ export const register: Register = (on, options) => {
     if (e.agentId === undefined) {
       lastAnswer = e.answer
       await refreshSummary($, true)
+      if (e.reason === 'answer' && e.answer.trim() !== '') {
+        await surfaceFollowUps($, `User: ${clip(lastPrompt, 2000)}\n\nClaude: ${e.answer}`)
+      }
       await writeBoardFile($)
     }
     return next(e)
@@ -726,6 +898,18 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'board' }, async ($, e) => {
     await refreshBoard($)
     if (e.args.trim() === 'prune') return { text: await pruneBoard($) }
+    if (e.args.trim() === 'scan') {
+      if (!useFollowUps) return { text: 'cc-board: loose-end scans are off (followUps).' }
+      try {
+        const messages = await $.session.messages()
+        if ('deny' in messages) return { text: 'cc-board: the transcript could not be read.' }
+        const found = await scanTranscript($, messages)
+        void $.ui.open({ id: PANE, title: 'cc-board' })
+        return { text: found === 0 ? 'cc-board: no new loose ends in this chat.' : `cc-board: ${found} loose end(s) added from this chat.` }
+      } catch (error) {
+        return { text: `cc-board: scan failed: ${String(error)}` }
+      }
+    }
     void $.ui.open({ id: PANE, title: 'cc-board' })
     const now = await $.clock.now()
     const merged = mergeSessions([...sessions.values()], [...remoteSessions.values()])
@@ -772,13 +956,17 @@ export const register: Register = (on, options) => {
     const rows = sortSessions(all, sessionId).filter(session => session.endedAt === undefined)
     if (rows.length === 0) return next(e)
 
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Button } = $.ui.resolve(e)
     return (
       <Box flexDirection="column">
         {rows.map(session => (
-          <Text bold={session.sessionId === sessionId} dimColor={isStale(session, now)} wrap="truncate-end">
-            {boardLine(session, session.sessionId === sessionId, now, machine)}
-          </Text>
+          <Button
+            key={`session-${session.sessionId}`}
+            plain
+            dimColor={isStale(session, now)}
+            label={boardLine(session, session.sessionId === sessionId, now, machine)}
+            onPress={press => void switchToSession($, session, press.surface)}
+          />
         ))}
       </Box>
     )

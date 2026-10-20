@@ -14,6 +14,17 @@ or from any line in Claude's reply that starts with `MANUAL:`. Each row is a
 button: click it in the Desktop Code tab or in a fullscreen terminal, or
 Tab to it and press Enter. `/done <id>` ticks an item from the keyboard.
 
+**Loose ends get surfaced.** The real point of the checklist is the small
+things said in passing and then forgotten: "you'll need to rotate the key
+later", "I've skipped the store listing for now", "oh, and remind me to
+bump the version". After a completed turn whose prompt or reply contains a
+cue phrase like those, Haiku reads that one exchange and lists the loose
+ends, which join the checklist tagged `(loose end)`. Nothing already on
+the list is added twice, and Claude is told they were noted for you, not
+assigned to it. The first time the mod meets a session it scans the whole
+conversation for loose ends mentioned before it loaded, and `/board scan`
+does so on demand. Turn all of this off with the `followUps` option.
+
 **Claude knows what you ticked.** Every change is sent to Claude as one
 short hidden note, only when something changed, and only the delta. If a
 later TodoWrite would reopen an item you ticked, the item stays done and the
@@ -33,11 +44,23 @@ the mod reads the transcript instead and seeds the checklist from the last
 TodoWrite call and any `MANUAL:` lines Claude wrote. Neither sends Claude a
 note, since Claude already knows all of it.
 
+**Click a session to switch to it.** Each band line is a button. A session
+records the terminal it runs in, and a click asks Terminal.app, then
+iTerm2, to bring that tab to the front. macOS asks once to let your
+terminal control them. A session the click cannot reach, a cloud session
+or one in the Desktop app, gets its resume command copied to the clipboard
+instead, with a toast saying so.
+
+**`/board scan`** reads the whole conversation for loose ends, newest
+first, in chunks, with at most eight Haiku calls, which is what to run on a
+long chat that predates the mod or has things lingering from earlier. The
+same scan runs by itself the first time the mod meets a session.
+
 **`/board`** prints the full board: every session, its open items, and the
 `claude --resume` command to get back to it. **`/board prune`** asks, then
 removes the files of stale or ended sessions.
 
-The summary comes from the in-progress todo, then the first pending todo,
+The summary comes from the in-progress task, then the first pending task,
 then the first line of your last prompt. Only when the todo list is empty
 does the mod ask Haiku for one sentence, at most once every five minutes.
 Turn that off with the `haikuSummary` option in `/config`.
@@ -45,54 +68,56 @@ Turn that off with the `haikuSummary` option in `/config`.
 ## Share the board across machines and cloud sessions
 
 By default the board is the local folder, so each machine sees only its own
-sessions. To see every session on one board, give the mod a secret GitHub
-gist. Each session then also writes its JSON document to the gist as a file
-named `<session-id>.json`, with a partial update that touches only that file,
-and polls the gist every fifteen seconds. Unchanged polls are answered with a
-304 through an ETag and do not count against the GitHub rate limit.
+sessions. To see every session on one board, including cloud sessions, give
+the mod a Supabase project with a `cc_board` table. Each session then also
+upserts its JSON document as that table's row for its session id, and
+polls the table every fifteen seconds. A GitHub gist would have been
+simpler, but cloud sessions cannot reach the gist API, so a table it is.
 
-Create a secret gist with one placeholder file. From a terminal with the
-GitHub CLI signed in:
+Create a free Supabase project of your own and run this once in its SQL
+editor. Row-level security is on with no policies, so the public
+publishable key can neither read nor write the table; the mod uses a secret
+key instead.
 
-```sh
-echo "cc-board shared board" | gh gist create --desc cc-board --filename cc-board.md -
+```sql
+create table if not exists public.cc_board (
+  session_id text primary key,
+  payload jsonb not null,
+  updated_at timestamptz not null default now()
+);
+alter table public.cc_board enable row level security;
 ```
 
-The last part of the printed URL is the gist id. You can also create it at
-gist.github.com; it needs any one file to exist.
-
-Then a token. A classic personal access token with only the `gist` scope is
-enough, and fine-grained tokens do not cover gists. The token the GitHub CLI
-already holds usually has that scope, and `gh auth token` prints it.
-
-On your Mac, put both in the mod's options in `~/.claude/settings.json`. The
-key is `cc-board@inline` for a mod loaded with `--plugin-dir` or
-`CLAUDE_CODE_PLUGIN_DIRS`, and `cc-board@claude-mods` once installed from the
-marketplace:
+Then copy a secret key from the project's API settings, the `service_role`
+key or a new secret key. On your Mac, put the project URL and that key in
+the mod's options in `~/.claude/settings.json`. The key is
+`cc-board@inline` for a mod loaded with `--plugin-dir` or
+`CLAUDE_CODE_PLUGIN_DIRS`, and `cc-board@claude-mods` once installed from
+the marketplace:
 
 ```json
 {
   "pluginConfigs": {
     "cc-board@inline": {
-      "boardGist": "0123456789abcdef0123456789abcdef",
-      "boardToken": "ghp_your_token"
+      "boardUrl": "https://yourproject.supabase.co",
+      "boardKey": "your secret key"
     }
   }
 }
 ```
 
-In a cloud environment, set `CC_BOARD_GIST` and `CC_BOARD_TOKEN` as
-environment variables on the environment, allow `api.github.com` in its
-network policy, and load the mod there with `CLAUDE_CODE_PLUGIN_DIRS` after a
-setup script clones this repository into the container. Anyone who can use
-that environment can read its variables, which is why the token should carry
-the `gist` scope and nothing else.
+In a cloud environment, set `CC_BOARD_URL` and `CC_BOARD_KEY` as
+environment variables on the environment and allow the project's host in
+its network settings (Custom access with `yourproject.supabase.co` listed,
+or Full). Load the mod there with `CLAUDE_CODE_PLUGIN_DIRS` after a setup
+script clones this repository into the container. Anyone who can use that
+environment can read its variables, so keep the project to this one table.
 
 Each session is tagged with where it runs, `cloud` or the Mac's host name,
 and the band shows the tag for sessions on other machines. `/board prune`
-removes stale sessions from the gist as well as the local folder. If the gist
-cannot be reached, the mod shows one toast, logs the reason, and carries on
-with the local board.
+removes stale sessions from the table as well as the local folder. If the
+table cannot be reached, the mod shows one toast, logs the reason, and
+carries on with the local board.
 
 ## Install for development
 
@@ -164,16 +189,19 @@ surfaces, and both restore paths at startup.
 - `hooks/checklist.ts` is the checklist logic, pure functions only.
 - `hooks/board.ts` is the board file shape, the stale rule, the merge of
   local and shared sessions, and the text the band and `/board` print.
-- `hooks/gist.ts` builds the gist requests and reads the gist's files.
+- `hooks/shared.ts` builds the table requests and reads the rows back.
 - `types/index.d.ts` declares the values kept in `$.state`.
 - `tests/` holds the tests `claude plugin test` runs.
 
 ## What it does not do
 
 It never answers or changes a tool call, and the only text it adds to a
-request is the checklist note. Its only network calls are the optional Haiku
-summary, through your own Claude Code credentials, and the gist reads and
-writes once you configure a gist. A missing board folder or a malformed board file is logged to
+request is the checklist note. It makes three kinds of network call, each
+with its own switch: the Haiku summary (`haikuSummary`), the Haiku
+loose-end scan of an exchange that carries a cue phrase (`followUps`), both
+through your own Claude Code credentials, and the table reads and writes
+once a shared board is configured (`boardUrl`). With all three off it
+touches nothing outside the machine. A missing board folder or a malformed board file is logged to
 the debug log (`claude --debug`) and skipped.
 
 There is no way for a mod to set the terminal tab title, and Claude Code

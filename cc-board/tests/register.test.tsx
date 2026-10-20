@@ -70,10 +70,29 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
       }
     }
     if (command === 'rm') for (const path of args.slice(1)) files.delete(path)
-    const stdout = command === 'hostname' ? 'mbp\n' : ''
+    let stdout = ''
+    if (command === 'hostname') stdout = 'mbp\n'
+    if (command === 'sh' && (args[1] ?? '').includes('ps -o tty=')) stdout = 'ttys003\n'
+    if (command === 'osascript') {
+      const script = args[1] ?? ''
+      scripts.push(script)
+      stdout = [...terminalTtys].some(one => script.includes(`"${one}"`)) ? 'ok\n' : 'none\n'
+    }
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  on('ui.toast', () => ({ value: undefined }))
+  // Terminal tabs the fake AppleScript can find, by tty, and the scripts it was handed.
+  const terminalTtys = new Set<string>()
+  const scripts: string[] = []
+  const copied: string[] = []
+  on('ui.copy', (_, e) => {
+    copied.push(e.text)
+    return { value: { isCopied: true } }
+  })
+  const toasts: string[] = []
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
   on('ui.log', () => ({ value: undefined }))
 
   on('session.id', () => ({ value: 'sess-A' }))
@@ -88,7 +107,7 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
     if (e.tool === 'TaskUpdate') return { result: { success: true, taskId: e.taskId, updatedFields: ['status'] } }
     if (e.tool === 'AskUserQuestion') {
       const answers: Record<string, string> = {}
-      for (const question of e.questions) answers[question.question] = 'Remove'
+      for (const question of e.questions) answers[question.question] = question.options[0]?.label ?? 'Remove'
       return { result: { questions: e.questions, answers } }
     }
     return { result: {} }
@@ -112,7 +131,7 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
   }
   const noteCount = () => session.appended().filter(one => one.door === 'note').length
 
-  return { files, clock, session, boardFile, put, lastNote, noteCount }
+  return { files, clock, session, boardFile, put, lastNote, noteCount, toasts, terminalTtys, scripts, copied }
 }
 
 const TODOS = [
@@ -232,12 +251,12 @@ test('the band lists every live session, marks this one and dims stale ones', as
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
-    const mine = await ui.find({ type: 'Text', text: /my-app/ })
+    const mine = await ui.find({ type: 'Button', text: /my-app/ })
     expect(mine?.text).toBe('▶ my-app · — · 0 open')
-    expect(mine?.props.bold).toBe(true)
-    const theirs = await ui.find({ type: 'Text', text: /other-repo/ })
+    expect(mine?.key).toBe('session-sess-A')
+    const theirs = await ui.find({ type: 'Button', text: /other-repo/ })
     expect(theirs?.text).toBe('  other-repo · Adding the settings page · 1 open')
-    const stale = await ui.find({ type: 'Text', text: /old-repo/ })
+    const stale = await ui.find({ type: 'Button', text: /old-repo/ })
     expect(stale?.props.dimColor).toBe(true)
     expect(stale?.text).toContain('stale')
     await ui.unmount()
@@ -327,54 +346,71 @@ test('a board file with no items still restores its saved summary', async ($, on
   expect(world.boardFile('sess-A')?.items).toEqual([])
 })
 
-/** A fake GitHub gist: records every request and serves the files it holds. */
-function fakeGist(on: On, files: Record<string, string>) {
-  const calls: { method: string; status: number; headers: Record<string, string> }[] = []
-  const gist = { files: { ...files } }
-  let etag = 'W/"1"'
+/** A fake cc_board table behind the Supabase REST API: records every request and serves its rows. */
+function fakeTable(on: On, rows: Record<string, unknown>) {
+  const calls: { method: string; url: string; status: number; headers: Record<string, string>; body?: string }[] = []
+  const table = new Map(Object.entries(rows))
   on('http.fetch', (_, e) => {
     const method = e.init?.method ?? 'GET'
     const headers = e.init?.headers ?? {}
-    const call = { method, status: 200, headers }
+    const call = { method, url: e.url, status: 200, headers, body: e.init?.body }
     calls.push(call)
+    if (headers.apikey !== 'secret') {
+      call.status = 401
+      return { value: { status: 401, ok: false, headers: {}, text: '{"message":"Invalid API key"}' } }
+    }
     if (method === 'GET') {
-      if (headers['if-none-match'] === etag) {
-        call.status = 304
-        return { value: { status: 304, ok: false, headers: { etag }, text: '' } }
+      // Newest first, capped as PostgREST caps a read.
+      const limit = Number(/limit=(\d+)/.exec(e.url)?.[1] ?? 1000)
+      const rows = [...table.values()] as { updatedAt: string }[]
+      rows.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+      const text = JSON.stringify(rows.slice(0, limit).map(payload => ({ payload })))
+      return { value: { status: 200, ok: true, headers: {}, text } }
+    }
+    if (method === 'POST') {
+      for (const row of JSON.parse(e.init?.body ?? '[]') as { session_id: string; payload: unknown }[]) table.set(row.session_id, row.payload)
+      call.status = 201
+      return { value: { status: 201, ok: true, headers: {}, text: '' } }
+    }
+    if (method === 'DELETE') {
+      const url = decodeURIComponent(e.url)
+      const byId = /session_id=in\.\((.*)\)$/.exec(url)
+      for (const id of (byId?.[1] ?? '').split(',').map(one => one.replace(/"/g, '')).filter(one => one !== '')) table.delete(id)
+      const before = /updated_at=lt\.(.*)$/.exec(url)?.[1]
+      if (before !== undefined) {
+        for (const [id, payload] of [...table.entries()] as [string, { updatedAt: string }][]) {
+          if (Date.parse(payload.updatedAt) < Date.parse(before)) table.delete(id)
+        }
       }
-      const body = { files: Object.fromEntries(Object.entries(gist.files).map(([name, content]) => [name, { content, truncated: false }])) }
-      return { value: { status: 200, ok: true, headers: { etag }, text: JSON.stringify(body) } }
+      call.status = 204
+      return { value: { status: 204, ok: true, headers: {}, text: '' } }
     }
-    const patch = JSON.parse(e.init?.body ?? '{}') as { files: Record<string, { content: string } | null> }
-    for (const [name, file] of Object.entries(patch.files)) {
-      if (file === null) delete gist.files[name]
-      else gist.files[name] = file.content
-    }
-    etag = `W/"${calls.length + 1}"`
-    return { value: { status: 200, ok: true, headers: { etag }, text: '{}' } }
+    call.status = 405
+    return { value: { status: 405, ok: false, headers: {}, text: '' } }
   })
-  return { calls, gist }
+  return { calls, table }
 }
 
-const OPTIONS = { options: { boardGist: 'gist123', boardToken: 'tok' } }
+const OPTIONS = { options: { boardUrl: 'https://proj.supabase.co', boardKey: 'secret' } }
 
-test('with a gist configured, this session’s file is mirrored there after a short pause', { ...OPTIONS }, async ($, on) => {
+test('with a shared board configured, this session’s row is upserted after a short pause', { ...OPTIONS }, async ($, on) => {
   const world = fakeWorld(on)
-  const remote = fakeGist(on, {})
+  const remote = fakeTable(on, {})
   await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
   await $.tool.call({ tool: 'TodoWrite', todos: [...TODOS] })
   await world.clock.advance(2000)
 
-  const patches = remote.calls.filter(call => call.method === 'PATCH')
-  expect(patches.length).toBe(1)
-  expect(patches[0]?.headers.authorization).toBe('Bearer tok')
-  const mirrored = parse(remote.gist.files['sess-A.json'] ?? '')
+  const writes = remote.calls.filter(call => call.method === 'POST')
+  expect(writes.length).toBe(1)
+  expect(writes[0]?.url).toBe('https://proj.supabase.co/rest/v1/cc_board')
+  expect(writes[0]?.headers.prefer).toContain('merge-duplicates')
+  const mirrored = parse(JSON.stringify(remote.table.get('sess-A')))
   expect(mirrored?.items.map(item => item.text)).toEqual(['Fix login', 'Rotate key'])
   expect(mirrored?.machine).toBe('mbp')
-  expect(remote.gist.files['sess-A.json']).toBe(world.files.get(`${BOARD_DIR}/sess-A.json`)?.text)
+  expect(JSON.stringify(remote.table.get('sess-A'))).toBe(JSON.stringify(JSON.parse(world.files.get(`${BOARD_DIR}/sess-A.json`)?.text ?? '')))
 })
 
-test('sessions from the gist join the band, polls reuse the etag, and prune deletes from both stores', { ...OPTIONS }, async ($, on) => {
+test('sessions from the shared board join the band, and prune deletes from both stores', { ...OPTIONS }, async ($, on) => {
   const world = fakeWorld(on)
   const cloud = {
     sessionId: 'sess-cloud',
@@ -386,26 +422,34 @@ test('sessions from the gist join the band, polls reuse the etag, and prune dele
     machine: 'cloud',
   }
   const old = { ...cloud, sessionId: 'sess-old', project: 'old-repo', updatedAt: '2026-10-10T11:55:00Z' }
-  const remote = fakeGist(on, { 'sess-cloud.json': JSON.stringify(cloud), 'sess-old.json': JSON.stringify(old) })
+  // Enough forgotten sessions that a capped read never returns the oldest ones.
+  const forgotten: Record<string, unknown> = {}
+  for (let i = 0; i < 600; i += 1) forgotten[`sess-gone-${i}`] = { ...old, sessionId: `sess-gone-${i}`, updatedAt: `2026-09-${String(1 + (i % 28)).padStart(2, '0')}T00:00:00Z` }
+  const remote = fakeTable(on, { 'sess-cloud': cloud, 'sess-old': old, ...forgotten })
 
   await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
   await world.clock.advance(15000)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  expect((await ui.find({ type: 'Text', text: /other-repo/ }))?.text).toBe('  other-repo · Adding the settings page · 1 open · @cloud')
-  expect((await ui.find({ type: 'Text', text: /old-repo/ }))?.props.dimColor).toBe(true)
+  expect((await ui.find({ type: 'Button', text: /other-repo/ }))?.text).toBe('  other-repo · Adding the settings page · 1 open · @cloud')
+  expect((await ui.find({ type: 'Button', text: /old-repo/ }))?.props.dimColor).toBe(true)
   await ui.unmount()
 
-  // Nothing changed on the gist since the last read, so the next poll sends the etag and is answered 304.
-  const before = remote.calls.length
-  await world.clock.advance(15000)
-  const polls = remote.calls.slice(before).filter(call => call.method === 'GET')
-  expect(polls.length).toBe(1)
-  expect(polls[0]?.status).toBe(304)
-
+  // The capped read holds 500 rows, so some stale rows were never seen; prune still removes them by time.
+  expect(remote.table.size).toBe(603)
   const result = await $.command.run({ command: 'board', args: 'prune', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
-  expect(result?.text).toContain('removed 1 session(s) (1 from the shared gist)')
-  expect(Object.keys(remote.gist.files).sort()).toEqual(['sess-A.json', 'sess-cloud.json'])
+  expect(result?.text).toContain('from the shared board')
+  expect([...remote.table.keys()].sort()).toEqual(['sess-A', 'sess-cloud'])
+})
+
+test('a refused key shows one toast and leaves the local board working', { options: { boardUrl: 'https://proj.supabase.co', boardKey: 'wrong' } }, async ($, on) => {
+  const world = fakeWorld(on)
+  fakeTable(on, {})
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'TodoWrite', todos: [...TODOS] })
+  await world.clock.advance(15000)
+  expect(world.toasts.filter(text => text.startsWith('shared board')).length).toBe(1)
+  expect(world.boardFile('sess-A')?.items.length).toBe(2)
 })
 
 test('TaskCreate and TaskUpdate drive the checklist, and a ticked task survives a reopen', async ($, on) => {
@@ -475,4 +519,128 @@ test('a Haiku summary stays until the next one, and the raw prompt is only a fir
   await $.turn.complete({ turnId: 't4', answer: 'Noted.', durationMs: 10, isAborted: false, reason: 'answer' })
   expect(asked).toBe(2)
   expect(world.boardFile('sess-A')?.summary).toBe('Fixing the login crash')
+})
+
+test('a completed turn that mentions something for later puts it on the checklist as a loose end', async ($, on) => {
+  const world = fakeWorld(on)
+  const asked: string[] = []
+  on('model.complete', (_, e) => {
+    asked.push(e.prompt)
+    const isScan = e.prompt.startsWith('Already on the checklist')
+    const text = isScan ? '- Rotate the API key in the portal\n- Bump the version before release' : 'Fixing the login crash'
+    return { value: { isAnswered: true, text, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
+  })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+
+  // No cue phrase: no scan.
+  await $.prompt.submit({ text: 'fix the login crash', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'fix the login crash', turnId: 't1' })
+  await $.turn.complete({ turnId: 't1', answer: 'Fixed the null reference and added a test.', durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(asked.filter(prompt => prompt.startsWith('Already on the checklist')).length).toBe(0)
+  expect(world.boardFile('sess-A')?.items).toEqual([])
+
+  // A cue phrase in the reply: one scan, two loose ends, one note to Claude.
+  await $.prompt.submit({ text: 'and the key?', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'and the key?', turnId: 't2' })
+  await $.turn.complete({ turnId: 't2', answer: "Done. You'll need to rotate the API key in the portal later, and bump the version before release.", durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(asked.filter(prompt => prompt.startsWith('Already on the checklist')).length).toBe(1)
+  expect(world.boardFile('sess-A')?.items.map(item => [item.id, item.text, item.source])).toEqual([
+    [1, 'Rotate the API key in the portal', 'followup'],
+    [2, 'Bump the version before release', 'followup'],
+  ])
+  await world.clock.advance(300)
+  expect(world.lastNote()).toContain('Loose ends noted')
+  expect(world.lastNote()).toContain('#1 "Rotate the API key in the portal"')
+
+  // The same loose ends again: the scan sees them on the checklist, nothing is added twice.
+  await $.prompt.submit({ text: 'remind me what is left', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'remind me what is left', turnId: 't3' })
+  await $.turn.complete({ turnId: 't3', answer: 'Rotate the API key in the portal later.', durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(world.boardFile('sess-A')?.items.length).toBe(2)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ key: 'item-1' }))?.props.label).toBe('[ ] #1 Rotate the API key in the portal (loose end)')
+  await ui.unmount()
+
+  // A loose end at the far end of a long reply still reaches the scan.
+  const long = `${'The parser now handles nested groups. '.repeat(250)}Also, remember to renew the signing certificate.`
+  await $.prompt.submit({ text: 'and the parser?', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'and the parser?', turnId: 't4' })
+  await $.turn.complete({ turnId: 't4', answer: long, durationMs: 10, isAborted: false, reason: 'answer' })
+  const scans = asked.filter(prompt => prompt.startsWith('Already on the checklist'))
+  expect(scans.length).toBe(3)
+  expect(scans[2]).toContain('renew the signing certificate')
+})
+
+test('/board prune sweeps rows hidden behind the read cap even when nothing stale is listed', { ...OPTIONS }, async ($, on) => {
+  const world = fakeWorld(on)
+  const rows: Record<string, unknown> = {}
+  for (let i = 0; i < 500; i += 1) {
+    rows[`sess-recent-${i}`] = { sessionId: `sess-recent-${i}`, project: 'p', cwd: '/w', summary: '', items: [], updatedAt: `2026-10-20T11:${String(i % 60).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}Z` }
+  }
+  for (let i = 0; i < 20; i += 1) {
+    rows[`sess-ancient-${i}`] = { sessionId: `sess-ancient-${i}`, project: 'p', cwd: '/w', summary: '', items: [], updatedAt: `2026-09-${String(1 + i).padStart(2, '0')}T00:00:00Z` }
+  }
+  const remote = fakeTable(on, rows)
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  await world.clock.advance(15000)
+  expect(remote.table.size).toBe(521)
+
+  const result = await $.command.run({ command: 'board', args: 'prune', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(result?.text).toContain('swept')
+  expect([...remote.table.keys()].some(id => id.startsWith('sess-ancient'))).toBe(false)
+  expect(remote.table.size).toBe(501)
+})
+
+test('a click on a board line raises that session’s terminal, or copies how to resume it', async ($, on) => {
+  const world = fakeWorld(on)
+  world.terminalTtys.add('/dev/ttys007')
+  const base = { project: 'other-repo', cwd: '/work/other-repo', summary: 'Adding the settings page', items: [], updatedAt: '2026-10-20T11:59:00Z' }
+  world.put(`${BOARD_DIR}/sess-B.json`, JSON.stringify({ ...base, sessionId: 'sess-B', machine: 'mbp', tty: '/dev/ttys007' }))
+  world.put(`${BOARD_DIR}/sess-C.json`, JSON.stringify({ ...base, sessionId: 'sess-C', project: 'cloud-repo', cwd: '/home/user/cloud-repo', machine: 'cloud' }))
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  expect(world.boardFile('sess-A')?.tty).toBe('/dev/ttys003')
+  await world.clock.advance(2000)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'session-sess-B' })
+  expect(world.scripts.length).toBe(1)
+  expect(world.scripts[0]).toContain('"/dev/ttys007"')
+  expect(world.copied).toEqual([])
+
+  await ui.press({ key: 'session-sess-C' })
+  expect(world.scripts.length).toBe(1)
+  expect(world.copied).toEqual(['cd /home/user/cloud-repo && claude --resume sess-C'])
+  expect(world.toasts.at(-1)).toContain('it runs on cloud')
+
+  await ui.press({ key: 'session-sess-A' })
+  expect(world.toasts.at(-1)).toBe('that is this session')
+  await ui.unmount()
+})
+
+test('a long-running chat is scanned for loose ends from its whole history, and /board scan repeats it', async ($, on) => {
+  const transcript: SessionMessage[] = []
+  for (let i = 0; i < 40; i += 1) {
+    transcript.push({ role: 'user', text: `question ${i}`, toolUses: [] })
+    transcript.push({ role: 'assistant', text: i === 2 ? 'Done. You will need to renew the push certificate later.' : `answer ${i}`, toolUses: [] })
+  }
+  const world = fakeWorld(on, transcript)
+  const scans: string[] = []
+  on('model.complete', (_, e) => {
+    if (e.prompt.startsWith('Already on the checklist')) scans.push(e.prompt)
+    const text = e.prompt.includes('push certificate') ? 'Renew the push certificate' : e.prompt.startsWith('Already') ? 'NONE' : 'Answering questions'
+    return { value: { isAnswered: true, text, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
+  })
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+
+  // Only the one chunk with a cue phrase cost a model call, and it reached back 76 messages.
+  expect(scans.length).toBe(1)
+  expect(world.boardFile('sess-A')?.items.map(item => [item.text, item.source])).toEqual([['Renew the push certificate', 'followup']])
+
+  const again = await $.command.run({ command: 'board', args: 'scan', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(again?.text).toBe('cc-board: no new loose ends in this chat.')
+  expect(world.boardFile('sess-A')?.items.length).toBe(1)
 })

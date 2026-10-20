@@ -13,6 +13,7 @@ export type Change =
   | { kind: 'ticked'; item: ChecklistItem }
   | { kind: 'unticked'; item: ChecklistItem }
   | { kind: 'manual-added'; item: ChecklistItem }
+  | { kind: 'followup-added'; item: ChecklistItem }
   | { kind: 'kept-done'; item: ChecklistItem }
 
 export const EMPTY_CHECKLIST: Checklist = { items: [], nextId: 1 }
@@ -68,7 +69,7 @@ export function mergeTodos(
   todos: readonly Todo[],
 ): { list: Checklist; keptDone: ChecklistItem[] } {
   const oldTodos = list.items.filter(item => item.source === 'todo')
-  const manual = list.items.filter(item => item.source === 'manual')
+  const manual = list.items.filter(item => item.source !== 'todo')
   const merged: ChecklistItem[] = []
   const keptDone: ChecklistItem[] = []
   let nextId = list.nextId
@@ -93,22 +94,71 @@ export function mergeTodos(
 }
 
 /** Adds a manual step unless one with the same text already exists. */
-export function addManual(
-  list: Checklist,
-  text: string,
-): { list: Checklist; item: ChecklistItem; added: boolean } {
+export function addManual(list: Checklist, text: string): { list: Checklist; item: ChecklistItem; added: boolean } {
+  return addItem(list, text, 'manual')
+}
+
+/** Adds a loose end surfaced from the conversation, unless an item already says the same thing. */
+export function addFollowUp(list: Checklist, text: string): { list: Checklist; item: ChecklistItem; added: boolean } {
+  return addItem(list, text, 'followup')
+}
+
+/** Lower case, no punctuation, one space between words: how two items are judged the same. */
+export function normalizeText(text: string): string {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
+}
+
+function addItem(list: Checklist, text: string, source: 'manual' | 'followup'): { list: Checklist; item: ChecklistItem; added: boolean } {
   const trimmed = text.trim()
-  const existing = list.items.find(item => item.text === trimmed)
+  const key = normalizeText(trimmed)
+  const existing = list.items.find(item => normalizeText(item.text) === key)
   if (existing !== undefined) return { list, item: existing, added: false }
 
-  const item: ChecklistItem = {
-    id: list.nextId,
-    text: trimmed,
-    source: 'manual',
-    status: 'pending',
-    ticked: false,
-  }
+  const item: ChecklistItem = { id: list.nextId, text: trimmed, source, status: 'pending', ticked: false }
   return { list: { items: [...list.items, item], nextId: list.nextId + 1 }, item, added: true }
+}
+
+const LOOSE_END_CUE =
+  /\b(later|remember|remind|don'?t forget|manual(?:ly)?|by hand|follow[ -]?ups?|out of scope|for now|not yet|still (?:need|have|to)|(?:you|we)(?:'ll| will| would| should| need| have)? (?:need|have|want) to|todo|to-do|make sure|before (?:you |we )?(?:ship|release|merge|deploy)|eventually|at some point|next steps?|after (?:this|that)|once (?:you|we)|when you get a chance|left (?:out|as is)|skipp?ed|deferred|temporar(?:y|ily)|workaround|not (?:yet )?(?:done|handled|covered|implemented))\b/i
+
+/** Whether an exchange is worth reading for loose ends. Cheap, so it runs on every turn. */
+export function hasLooseEndCue(text: string): boolean {
+  return LOOSE_END_CUE.test(text)
+}
+
+/**
+ * What a scan reads of a long exchange: the whole text when it fits, else
+ * the passages around every cue, with `radius` characters of context each
+ * side, merged where they overlap. Past `max`, the latest passages are kept.
+ */
+export function cueExcerpts(text: string, max = 6000, radius = 600): string {
+  if (text.length <= max) return text
+  const windows: [number, number][] = []
+  for (const match of text.matchAll(new RegExp(LOOSE_END_CUE.source, 'gi'))) {
+    const start = Math.max(0, match.index - radius)
+    const end = Math.min(text.length, match.index + match[0].length + radius)
+    const last = windows[windows.length - 1]
+    if (last !== undefined && start <= last[1]) last[1] = Math.max(last[1], end)
+    else windows.push([start, end])
+  }
+  const joined = windows.map(([start, end]) => text.slice(start, end)).join('\n…\n')
+  return joined.length <= max ? joined : joined.slice(joined.length - max)
+}
+
+/**
+ * The loose ends a model listed, one per line: bullets and numbering
+ * stripped, NONE and empty lines dropped, repeats and over-long lines removed.
+ */
+export function parseFollowUpLines(reply: string, max = 3): string[] {
+  const lines: string[] = []
+  for (const raw of reply.split('\n')) {
+    const line = raw.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').trim()
+    if (line === '' || /^none\.?$/i.test(line) || line.length > 120) continue
+    if (lines.some(one => normalizeText(one) === normalizeText(line))) continue
+    lines.push(line)
+    if (lines.length === max) break
+  }
+  return lines
 }
 
 /** Ticks an item done, or unticks it back to pending. */
@@ -164,6 +214,7 @@ export function describeChanges(changes: readonly Change[]): string {
   const ticked = of('ticked')
   const unticked = of('unticked')
   const manual = of('manual-added')
+  const followUps = of('followup-added')
   const kept = of('kept-done')
 
   const parts: string[] = []
@@ -173,6 +224,9 @@ export function describeChanges(changes: readonly Change[]): string {
   }
   if (unticked.length > 0) parts.push(`The user reopened: ${quote(unticked)}.`)
   if (manual.length > 0) parts.push(`New manual steps the user will do by hand (not you): ${quote(manual)}.`)
+  if (followUps.length > 0) {
+    parts.push(`Loose ends noted on the user's checklist so they are not forgotten (no action from you unless asked): ${quote(followUps)}.`)
+  }
   if (ticked.length > 0 || kept.length > 0) {
     parts.push('Do not remind the user about done items or add them back to TodoWrite.')
   }
@@ -207,8 +261,8 @@ function updateFailed(result: unknown): boolean {
 export function reconcile(saved: Checklist, replayed: Checklist): Checklist {
   let list = saved
   for (const item of replayed.items) {
-    if (item.source === 'manual') {
-      list = addManual(list, item.text).list
+    if (item.source === 'manual' || item.source === 'followup') {
+      list = addItem(list, item.text, item.source).list
       continue
     }
     const known = list.items.find(one => (item.taskId !== undefined && one.taskId === item.taskId) || (one.source === 'todo' && one.text === item.text))

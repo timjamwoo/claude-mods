@@ -2,13 +2,17 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import {
   EMPTY_CHECKLIST,
+  addFollowUp,
   addManual,
   applyTaskEvent,
+  cueExcerpts,
   describeChanges,
-  reconcile,
+  hasLooseEndCue,
   mergeTodos,
+  parseFollowUpLines,
   parseItemId,
   parseManualLines,
+  reconcile,
   seedFromTranscript,
   setTicked,
 } from '../hooks/checklist'
@@ -190,5 +194,53 @@ describe('seedFromTranscript', () => {
   test('an empty or task-free transcript seeds nothing', async () => {
     expect(seedFromTranscript([])).toEqual(EMPTY_CHECKLIST)
     expect(seedFromTranscript([{ role: 'assistant', text: 'hi', toolUses: [] }])).toEqual(EMPTY_CHECKLIST)
+  })
+})
+
+describe('loose ends', () => {
+  test('the cue detector fires on things said in passing and not on plain work', async () => {
+    expect(hasLooseEndCue("You'll need to rotate the key in the portal later.")).toBe(true)
+    expect(hasLooseEndCue('I skipped the store listing for now.')).toBe(true)
+    expect(hasLooseEndCue('oh and remind me to bump the version')).toBe(true)
+    expect(hasLooseEndCue('Make sure the signing cert is renewed before you ship.')).toBe(true)
+    expect(hasLooseEndCue('Fixed the null reference in LoginPage and added a test.')).toBe(false)
+  })
+
+  test('cueExcerpts keeps every cue of a long exchange, with context', async () => {
+    const filler = 'The parser now handles nested groups correctly. '.repeat(200)
+    const text = `${filler}You'll need to rotate the key later.\n${filler}Also remember to bump the version.`
+    expect(text.length > 6000).toBe(true)
+    const excerpt = cueExcerpts(text)
+    expect(excerpt.length <= 6000).toBe(true)
+    expect(excerpt).toContain('rotate the key later')
+    expect(excerpt).toContain('bump the version')
+    expect(cueExcerpts('short text, later')).toBe('short text, later')
+  })
+
+  test('parseFollowUpLines strips bullets, drops NONE and repeats, and caps the list', async () => {
+    expect(parseFollowUpLines('NONE')).toEqual([])
+    expect(parseFollowUpLines('- Rotate the API key in the portal\n2. Bump the version\n• rotate the api key in the portal!\n\nSubmit the build')).toEqual([
+      'Rotate the API key in the portal',
+      'Bump the version',
+      'Submit the build',
+    ])
+    expect(parseFollowUpLines('a\nb\nc\nd\ne\nf\ng').length).toBe(3)
+  })
+
+  test('addFollowUp dedupes against any item by normalized text', async () => {
+    const list = addManual(EMPTY_CHECKLIST, 'Rotate the API key').list
+    const again = addFollowUp(list, 'rotate the API key.')
+    expect(again.added).toBe(false)
+    const fresh = addFollowUp(list, 'Bump the version')
+    expect(fresh.item.source).toBe('followup')
+    expect(fresh.list.items.length).toBe(2)
+  })
+
+  test('describeChanges tells Claude loose ends are noted, not assigned', async () => {
+    const item = { id: 4, text: 'Bump the version', source: 'followup' as const, status: 'pending' as const, ticked: false }
+    const note = describeChanges([{ kind: 'followup-added', item }])
+    expect(note).toContain('Loose ends noted')
+    expect(note).toContain('#4 "Bump the version"')
+    expect(note).toContain('no action from you')
   })
 })
