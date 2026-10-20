@@ -16,12 +16,15 @@ import type { EngineInterface, PluginOptions, Register, Timer } from 'claude-cod
 import type { BoardSession, Checklist, ChecklistItem } from '../types'
 import {
   EMPTY_CHECKLIST,
+  addFollowUp,
   addManual,
   applyTaskEvent,
   describeChanges,
+  hasLooseEndCue,
   mergeTodos,
   openItems,
   parseItemId,
+  parseFollowUpLines,
   parseManualLines,
   reconcile,
   seedFromTranscript,
@@ -44,6 +47,7 @@ import {
   parse,
   serialize,
   sortSessions,
+  sourceTag,
   STALE_AFTER_MS,
 } from './board'
 import { deleteBeforeUrl, deleteUrl, parseRows, readUrl, sharedHeaders, tableUrl, upsertBody, upsertHeaders } from './shared'
@@ -62,6 +66,7 @@ const board = atom({ plugin: 'cc-board', key: 'board' } as const, [])
 // ---- Module state (a hot reload resets it; session.start refills it) ------
 
 let useHaiku = true
+let useFollowUps = true
 let pluginOptions: PluginOptions = {}
 
 let sessionId = ''
@@ -423,6 +428,56 @@ async function addManualLines($: EngineInterface, text: string): Promise<number>
   return count
 }
 
+// ---- Loose ends -------------------------------------------------------------
+
+/**
+ * Asks Haiku which loose ends `text` mentions (things to do later, by hand,
+ * or not yet done), skipping what the checklist already holds. Resolves the
+ * new lines, or none.
+ */
+async function extractFollowUps($: EngineInterface, text: string): Promise<string[]> {
+  const list = await read($, checklist)
+  const open = list.items.filter(item => item.status !== 'completed').map(item => `- ${item.text}`).join('\n')
+  try {
+    const reply = await $.model.complete({
+      model: 'haiku',
+      system:
+        'You keep a checklist for a developer so nothing said in passing is forgotten. Read the exchange and list only loose ends: things someone said should happen later, must be done by hand, were deferred or skipped for now, or were asked for and not done. Do not list work the reply says is finished, and do not list anything already on the checklist. One per line, imperative, at most twelve words, at most five lines, no numbering, no commentary. If there is nothing, reply NONE.',
+      prompt: `Already on the checklist:\n${open === '' ? '(nothing)' : open}\n\nExchange:\n${clip(text, 6000)}`,
+      maxTokens: 160,
+      effort: 'low',
+      timeoutMs: 10000,
+    })
+    if (!reply.isAnswered) {
+      log($, `loose-end scan skipped: ${reply.reason}`)
+      return []
+    }
+    return parseFollowUpLines(reply.text)
+  } catch (error) {
+    log($, `loose-end scan failed: ${String(error)}`)
+    return []
+  }
+}
+
+/** Adds the loose ends found in `text` to the checklist and tells Claude. Resolves how many were new. */
+async function surfaceFollowUps($: EngineInterface, text: string): Promise<number> {
+  if (!useFollowUps || !hasLooseEndCue(text)) return 0
+  let count = 0
+  for (const line of await extractFollowUps($, text)) {
+    let added: ChecklistItem | undefined
+    await update($, checklist, (list: Checklist) => {
+      const result = addFollowUp(list, line)
+      added = result.added ? result.item : undefined
+      return result.list
+    })
+    if (added === undefined) continue
+    count += 1
+    queueChange($, { kind: 'followup-added', item: added })
+    $.ui.toast(`loose end #${added.id}: ${clip(added.text, 60)}`)
+  }
+  return count
+}
+
 async function bindSession($: EngineInterface): Promise<void> {
   sessionId = await $.session.id()
   const repo = await $.session.repo().catch(() => null)
@@ -471,6 +526,9 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
     if (list.items.length === 0 && lastPrompt === '') return 'none'
     await update($, checklist, () => list)
     await refreshSummary($, false)
+    // One scan of the recent conversation for loose ends mentioned before the mod loaded.
+    const recent = messages.slice(-30).map(message => `${message.role === 'user' ? 'User' : 'Claude'}: ${cleanPrompt(message.text)}`).join('\n\n')
+    await surfaceFollowUps($, recent.slice(-6000))
     return 'transcript'
   } catch (error) {
     log($, `seed from transcript failed: ${String(error)}`)
@@ -551,14 +609,14 @@ function itemMark(item: ChecklistItem): string {
 }
 
 function itemLabel(item: ChecklistItem): string {
-  const source = item.source === 'manual' ? ' (manual)' : ''
-  return `${itemMark(item)} #${item.id} ${item.text}${source}`
+  return `${itemMark(item)} #${item.id} ${item.text}${sourceTag(item)}`
 }
 
 // ---- Hooks ----------------------------------------------------------------
 
 export const register: Register = (on, options) => {
   useHaiku = options.haikuSummary !== false
+  useFollowUps = options.followUps !== false
   pluginOptions = options
 
   on('session.start', async ($, e, next) => {
@@ -694,6 +752,9 @@ export const register: Register = (on, options) => {
     if (e.agentId === undefined) {
       lastAnswer = e.answer
       await refreshSummary($, true)
+      if (e.reason === 'answer' && e.answer.trim() !== '') {
+        await surfaceFollowUps($, `User: ${clip(lastPrompt, 2000)}\n\nClaude: ${e.answer}`)
+      }
       await writeBoardFile($)
     }
     return next(e)

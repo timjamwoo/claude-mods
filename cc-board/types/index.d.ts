@@ -2,8 +2,8 @@
 // value the hooks module names against `PluginState` below, and the hooks
 // module imports these types from '../types'.
 
-/** Where a checklist item came from. */
-export type ItemSource = 'todo' | 'manual'
+/** Where a checklist item came from: Claude's task list, a /manual or MANUAL: step, or a loose end surfaced from the conversation. */
+export type ItemSource = 'todo' | 'manual' | 'followup'
 
 /** The same three states TodoWrite uses. */
 export type ItemStatus = 'pending' | 'in_progress' | 'completed'

@@ -12,6 +12,12 @@
       "description": "When the todo list is empty, ask Haiku for a one-sentence summary of what the session is doing (at most once per five minutes).",
       "default": true
     },
+    "followUps": {
+      "type": "boolean",
+      "title": "Surface loose ends",
+      "description": "After a turn that mentions something to do later, by hand, or not yet, ask Haiku to list those loose ends and add them to the checklist.",
+      "default": true
+    },
     "boardUrl": {
       "type": "string",
       "title": "Shared board URL",

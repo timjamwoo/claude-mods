@@ -14,6 +14,17 @@ or from any line in Claude's reply that starts with `MANUAL:`. Each row is a
 button: click it in the Desktop Code tab or in a fullscreen terminal, or
 Tab to it and press Enter. `/done <id>` ticks an item from the keyboard.
 
+**Loose ends get surfaced.** The real point of the checklist is the small
+things said in passing and then forgotten: "you'll need to rotate the key
+later", "I've skipped the store listing for now", "oh, and remind me to
+bump the version". After a completed turn whose prompt or reply contains a
+cue phrase like those, Haiku reads that one exchange and lists the loose
+ends, which join the checklist tagged `(loose end)`. Nothing already on
+the list is added twice, and Claude is told they were noted for you, not
+assigned to it. The first time the mod meets a session it scans the recent
+conversation once for loose ends mentioned before it loaded. Turn this
+off with the `followUps` option.
+
 **Claude knows what you ticked.** Every change is sent to Claude as one
 short hidden note, only when something changed, and only the delta. If a
 later TodoWrite would reopen an item you ticked, the item stays done and the
@@ -37,7 +48,7 @@ note, since Claude already knows all of it.
 `claude --resume` command to get back to it. **`/board prune`** asks, then
 removes the files of stale or ended sessions.
 
-The summary comes from the in-progress todo, then the first pending todo,
+The summary comes from the in-progress task, then the first pending task,
 then the first line of your last prompt. Only when the todo list is empty
 does the mod ask Haiku for one sentence, at most once every five minutes.
 Turn that off with the `haikuSummary` option in `/config`.

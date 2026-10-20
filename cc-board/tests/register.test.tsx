@@ -505,3 +505,48 @@ test('a Haiku summary stays until the next one, and the raw prompt is only a fir
   expect(asked).toBe(2)
   expect(world.boardFile('sess-A')?.summary).toBe('Fixing the login crash')
 })
+
+test('a completed turn that mentions something for later puts it on the checklist as a loose end', async ($, on) => {
+  const world = fakeWorld(on)
+  const asked: string[] = []
+  on('model.complete', (_, e) => {
+    asked.push(e.prompt)
+    const isScan = e.prompt.startsWith('Already on the checklist')
+    const text = isScan ? '- Rotate the API key in the portal\n- Bump the version before release' : 'Fixing the login crash'
+    return { value: { isAnswered: true, text, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
+  })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+
+  // No cue phrase: no scan.
+  await $.prompt.submit({ text: 'fix the login crash', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'fix the login crash', turnId: 't1' })
+  await $.turn.complete({ turnId: 't1', answer: 'Fixed the null reference and added a test.', durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(asked.filter(prompt => prompt.startsWith('Already on the checklist')).length).toBe(0)
+  expect(world.boardFile('sess-A')?.items).toEqual([])
+
+  // A cue phrase in the reply: one scan, two loose ends, one note to Claude.
+  await $.prompt.submit({ text: 'and the key?', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'and the key?', turnId: 't2' })
+  await $.turn.complete({ turnId: 't2', answer: "Done. You'll need to rotate the API key in the portal later, and bump the version before release.", durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(asked.filter(prompt => prompt.startsWith('Already on the checklist')).length).toBe(1)
+  expect(world.boardFile('sess-A')?.items.map(item => [item.id, item.text, item.source])).toEqual([
+    [1, 'Rotate the API key in the portal', 'followup'],
+    [2, 'Bump the version before release', 'followup'],
+  ])
+  await world.clock.advance(300)
+  expect(world.lastNote()).toContain('Loose ends noted')
+  expect(world.lastNote()).toContain('#1 "Rotate the API key in the portal"')
+
+  // The same loose ends again: the scan sees them on the checklist, nothing is added twice.
+  await $.prompt.submit({ text: 'remind me what is left', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'remind me what is left', turnId: 't3' })
+  await $.turn.complete({ turnId: 't3', answer: 'Rotate the API key in the portal later.', durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(world.boardFile('sess-A')?.items.length).toBe(2)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ key: 'item-1' }))?.props.label).toBe('[ ] #1 Rotate the API key in the portal (loose end)')
+  await ui.unmount()
+})

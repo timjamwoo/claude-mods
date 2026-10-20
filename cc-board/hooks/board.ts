@@ -33,7 +33,7 @@ function parseItem(value: unknown): ChecklistItem | undefined {
   if (!isRecord(value)) return undefined
   const { id, text, source, status, ticked, taskId } = value
   if (typeof id !== 'number' || typeof text !== 'string') return undefined
-  if (source !== 'todo' && source !== 'manual') return undefined
+  if (source !== 'todo' && source !== 'manual' && source !== 'followup') return undefined
   if (!STATUSES.includes(status as ItemStatus)) return undefined
   const item: ChecklistItem = { id, text, source, status: status as ItemStatus, ticked: ticked === true }
   if (typeof taskId === 'string' && taskId !== '') item.taskId = taskId
@@ -159,6 +159,13 @@ export function sortSessions(sessions: readonly BoardSession[], currentId: strin
   })
 }
 
+/** The tag drawn after an item that is not one of Claude's tasks. */
+export function sourceTag(item: ChecklistItem): string {
+  if (item.source === 'manual') return ' (manual)'
+  if (item.source === 'followup') return ' (loose end)'
+  return ''
+}
+
 function mark(item: ChecklistItem): string {
   if (item.status === 'completed') return '[x]'
   if (item.status === 'in_progress') return '[>]'
@@ -177,8 +184,7 @@ export function fullBoardText(sessions: readonly BoardSession[], currentId: stri
     const suffix = flags.length > 0 ? `  (${flags.join(', ')})` : ''
     lines.push(boardLine(session, session.sessionId === currentId, nowMs, homeMachine).trimStart() + suffix)
     for (const item of openItems(session.items)) {
-      const source = item.source === 'manual' ? ' (manual)' : ''
-      lines.push(`    ${mark(item)} #${item.id} ${item.text}${source}`)
+      lines.push(`    ${mark(item)} #${item.id} ${item.text}${sourceTag(item)}`)
     }
     lines.push(`    cwd: ${session.cwd}`)
     const elsewhere = session.machine !== undefined && session.machine !== homeMachine ? `  (on ${session.machine})` : ''
