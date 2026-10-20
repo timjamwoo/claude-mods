@@ -3,7 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import {
   EMPTY_CHECKLIST,
   addManual,
-  checklistFromSeed,
+  applyTaskEvent,
   describeChanges,
   mergeTodos,
   parseItemId,
@@ -107,30 +107,65 @@ describe('describeChanges and parseItemId', () => {
   })
 })
 
+describe('applyTaskEvent', () => {
+  test('TaskCreate adds a task once, TaskUpdate changes it, deleted removes it', async () => {
+    const created = applyTaskEvent(EMPTY_CHECKLIST, { kind: 'created', taskId: 't1', subject: 'Fix login' })
+    expect(created.item?.id).toBe(1)
+    expect(created.item?.taskId).toBe('t1')
+    const again = applyTaskEvent(created.list, { kind: 'created', taskId: 't1', subject: 'Fix login' })
+    expect(again.list.items.length).toBe(1)
+
+    const started = applyTaskEvent(again.list, { kind: 'updated', taskId: 't1', status: 'in_progress', subject: 'Fix the login crash' })
+    expect(started.item).toEqual({ id: 1, text: 'Fix the login crash', source: 'todo', status: 'in_progress', ticked: false, taskId: 't1' })
+    expect(applyTaskEvent(started.list, { kind: 'updated', taskId: 'unknown', status: 'completed' }).list).toEqual(started.list)
+    expect(applyTaskEvent(started.list, { kind: 'updated', taskId: 't1', status: 'deleted' }).list.items).toEqual([])
+  })
+
+  test('a ticked task stays done when TaskUpdate reopens it, and is reported', async () => {
+    const created = applyTaskEvent(EMPTY_CHECKLIST, { kind: 'created', taskId: 't1', subject: 'Rotate key' }).list
+    const ticked = setTicked(created, 1, true).list
+    const reopened = applyTaskEvent(ticked, { kind: 'updated', taskId: 't1', status: 'pending' })
+    expect(reopened.list.items[0]?.status).toBe('completed')
+    expect(reopened.keptDone?.id).toBe(1)
+  })
+
+  test('a TaskCreate for a todo of the same text attaches the id instead of duplicating', async () => {
+    const fromTodo = mergeTodos(EMPTY_CHECKLIST, [{ content: 'Fix login', status: 'pending', activeForm: 'x' }]).list
+    const { list } = applyTaskEvent(fromTodo, { kind: 'created', taskId: 't9', subject: 'Fix login' })
+    expect(list.items).toEqual([{ id: 1, text: 'Fix login', source: 'todo', status: 'pending', ticked: false, taskId: 't9' }])
+  })
+})
+
 describe('seedFromTranscript', () => {
   const todoUse = (todos: unknown, agentId?: string) => ({ tool: 'TodoWrite', input: { todos }, ...(agentId === undefined ? {} : { agentId }) })
 
-  test('takes the last main-loop TodoWrite and every MANUAL: line', async () => {
-    const seed = seedFromTranscript([
+  test('replays TodoWrite, the Task tools and MANUAL: lines from the main loop only', async () => {
+    const list = seedFromTranscript([
       { role: 'user', text: 'MANUAL: not from Claude, ignored', toolUses: [] },
       { role: 'assistant', text: 'Starting.', toolUses: [todoUse([{ content: 'Old item', status: 'pending' }])] },
       { role: 'assistant', text: 'MANUAL: Rotate the key', toolUses: [todoUse([{ content: 'Fix login', status: 'in_progress' }, { content: 'bad', status: 'nope' }, 42])] },
       { role: 'assistant', text: 'Subagent work', toolUses: [todoUse([{ content: 'Agent item', status: 'pending' }], 'agent-1')] },
+      {
+        role: 'assistant',
+        text: 'Planned.',
+        toolUses: [
+          { tool: 'TaskCreate', input: { subject: 'Add tests', description: 'd' }, result: { task: { id: 't1', subject: 'Add tests' } } },
+          { tool: 'TaskCreate', input: { subject: 'Agent task', description: 'd' }, result: { task: { id: 't2', subject: 'Agent task' } }, agentId: 'agent-1' },
+          { tool: 'TaskUpdate', input: { taskId: 't1', status: 'in_progress' }, result: { success: true, taskId: 't1', updatedFields: ['status'] } },
+        ],
+      },
       { role: 'assistant', text: '- MANUAL: Rotate the key\n- MANUAL: Submit the build', toolUses: [] },
     ])
-    expect(seed.todos).toEqual([{ content: 'Fix login', status: 'in_progress' }])
-    expect(seed.manualLines).toEqual(['Rotate the key', 'Submit the build'])
-
-    const list = checklistFromSeed(seed)
-    expect(list.items.map(item => [item.id, item.text, item.source, item.status])).toEqual([
-      [1, 'Fix login', 'todo', 'in_progress'],
-      [2, 'Rotate the key', 'manual', 'pending'],
-      [3, 'Submit the build', 'manual', 'pending'],
+    expect(list.items.map(item => [item.id, item.text, item.source, item.status, item.taskId])).toEqual([
+      [2, 'Fix login', 'todo', 'in_progress', undefined],
+      [3, 'Add tests', 'todo', 'in_progress', 't1'],
+      [4, 'Rotate the key', 'manual', 'pending', undefined],
+      [5, 'Submit the build', 'manual', 'pending', undefined],
     ])
   })
 
-  test('an empty or todo-free transcript seeds nothing', async () => {
-    expect(seedFromTranscript([])).toEqual({ todos: undefined, manualLines: [] })
-    expect(checklistFromSeed(seedFromTranscript([{ role: 'assistant', text: 'hi', toolUses: [] }]))).toEqual(EMPTY_CHECKLIST)
+  test('an empty or task-free transcript seeds nothing', async () => {
+    expect(seedFromTranscript([])).toEqual(EMPTY_CHECKLIST)
+    expect(seedFromTranscript([{ role: 'assistant', text: 'hi', toolUses: [] }])).toEqual(EMPTY_CHECKLIST)
   })
 })

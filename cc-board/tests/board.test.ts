@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { BoardSession } from '../types'
-import { basename, boardLine, cheapSummary, fullBoardText, isLive, isStale, parse, serialize } from '../hooks/board'
+import { basename, boardLine, cheapSummary, cleanPrompt, fullBoardText, isLive, isStale, parse, serialize } from '../hooks/board'
 
 const NOW = Date.parse('2026-10-20T12:00:00Z')
 
@@ -46,17 +46,25 @@ describe('board files', () => {
 
 describe('summary and lines', () => {
   test('the in-progress todo wins, then a pending todo, then the prompt', async () => {
-    expect(cheapSummary(session.items, 'please fix things')).toEqual({ text: 'Fix login', fromTodo: true })
+    expect(cheapSummary(session.items, 'please fix things')).toEqual({ text: 'Fix login', fromTask: true })
     const pending = [{ id: 1, text: 'Add tests', source: 'todo' as const, status: 'pending' as const, ticked: false }]
     expect(cheapSummary(pending, 'x').text).toBe('Add tests')
     expect(cheapSummary([], '\n  Rotate the signing key\nmore detail')).toEqual({
       text: 'Rotate the signing key',
-      fromTodo: false,
+      fromTask: false,
     })
+  })
+
+  test('injected tags are dropped from a prompt before it is summarized', async () => {
+    const prompt = '<artifact-view-context artifact="6e2f">\nsome context\n</artifact-view-context>\n<task-notification>\nok and what about the claude prompt update?'
+    expect(cleanPrompt(prompt)).toBe('ok and what about the claude prompt update?')
+    expect(cleanPrompt('<task-notification>\n<status>done</status>\n</task-notification>')).toBe('')
+    expect(cheapSummary([], prompt).text).toBe('ok and what about the claude prompt update?')
   })
 
   test('the band line marks the current session and counts open items', async () => {
     expect(boardLine(session, true, NOW)).toBe('▶ my-app · Fixing the login crash · 1 open')
+    expect(boardLine({ ...session, summary: '' }, false, NOW)).toBe('  my-app · — · 1 open')
     const old = { ...session, updatedAt: '2026-10-17T11:30:00Z' }
     expect(boardLine(old, false, NOW)).toBe('  my-app · Fixing the login crash · 1 open · stale 3d')
   })

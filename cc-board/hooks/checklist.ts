@@ -17,6 +17,44 @@ export type Change =
 
 export const EMPTY_CHECKLIST: Checklist = { items: [], nextId: 1 }
 
+/** What the Task tools tell the checklist: a task was made, or one changed. */
+export type TaskEvent =
+  | { kind: 'created'; taskId: string; subject: string }
+  | { kind: 'updated'; taskId: string; status?: ItemStatus | 'deleted'; subject?: string }
+
+/**
+ * Applies one TaskCreate or TaskUpdate to the checklist. A task the person
+ * ticked stays completed when an update reopens it, reported in `keptDone`.
+ * An update for a task the checklist never saw is ignored.
+ */
+export function applyTaskEvent(list: Checklist, event: TaskEvent): { list: Checklist; item?: ChecklistItem; keptDone?: ChecklistItem } {
+  if (event.kind === 'created') {
+    const subject = event.subject.trim()
+    const known = list.items.find(item => item.taskId === event.taskId)
+    if (known !== undefined) return { list, item: known }
+    const sameText = list.items.find(item => item.source === 'todo' && item.taskId === undefined && item.text === subject)
+    if (sameText !== undefined) {
+      const item = { ...sameText, taskId: event.taskId }
+      return { list: { ...list, items: list.items.map(one => (one === sameText ? item : one)) }, item }
+    }
+    const item: ChecklistItem = { id: list.nextId, text: subject, source: 'todo', status: 'pending', ticked: false, taskId: event.taskId }
+    return { list: { items: [...list.items, item], nextId: list.nextId + 1 }, item }
+  }
+
+  const found = list.items.find(item => item.taskId === event.taskId)
+  if (found === undefined) return { list }
+  if (event.status === 'deleted') return { list: { ...list, items: list.items.filter(item => item !== found) }, item: found }
+
+  let item: ChecklistItem = { ...found }
+  if (event.subject !== undefined && event.subject.trim() !== '') item.text = event.subject.trim()
+  let keptDone: ChecklistItem | undefined
+  if (event.status !== undefined) {
+    if (found.ticked && event.status !== 'completed') keptDone = found
+    else item.status = event.status
+  }
+  return { list: { ...list, items: list.items.map(one => (one === found ? item : one)) }, item, keptDone }
+}
+
 /**
  * Applies a TodoWrite call to the checklist.
  *
@@ -145,7 +183,7 @@ export function describeChanges(changes: readonly Change[]): string {
 export type TranscriptMessage = {
   role: 'user' | 'assistant'
   text: string
-  toolUses: readonly { tool: string; input: Record<string, unknown>; agentId?: string }[]
+  toolUses: readonly { tool: string; input: Record<string, unknown>; result?: unknown; agentId?: string }[]
 }
 
 function parseTodo(value: unknown): Todo | undefined {
@@ -156,32 +194,48 @@ function parseTodo(value: unknown): Todo | undefined {
   return { content, status }
 }
 
+function createdTaskId(result: unknown): string | undefined {
+  if (typeof result !== 'object' || result === null) return undefined
+  const task = (result as { task?: unknown }).task
+  if (typeof task !== 'object' || task === null) return undefined
+  const id = (task as { id?: unknown }).id
+  return typeof id === 'string' ? id : undefined
+}
+
 /**
- * What a session that predates the mod has already decided: the todos of the
- * last TodoWrite on the main loop, and every MANUAL: line Claude wrote.
- * `todos` is undefined when no TodoWrite call was found.
+ * Rebuilds the checklist a session that predates the mod would have had:
+ * the last TodoWrite on the main loop, every TaskCreate and TaskUpdate in
+ * order, and every MANUAL: line Claude wrote. Subagents' calls are ignored.
  */
-export function seedFromTranscript(messages: readonly TranscriptMessage[]): { todos: Todo[] | undefined; manualLines: string[] } {
-  let todos: Todo[] | undefined
+export function seedFromTranscript(messages: readonly TranscriptMessage[]): Checklist {
+  let list = EMPTY_CHECKLIST
   const manualLines: string[] = []
 
   for (const message of messages) {
     if (message.role !== 'assistant') continue
     for (const use of message.toolUses) {
-      if (use.tool !== 'TodoWrite' || use.agentId !== undefined) continue
-      const raw = use.input.todos
-      if (Array.isArray(raw)) todos = raw.map(parseTodo).filter((todo): todo is Todo => todo !== undefined)
+      if (use.agentId !== undefined) continue
+      if (use.tool === 'TodoWrite') {
+        const raw = use.input.todos
+        if (Array.isArray(raw)) list = mergeTodos(list, raw.map(parseTodo).filter((todo): todo is Todo => todo !== undefined)).list
+      } else if (use.tool === 'TaskCreate') {
+        const taskId = createdTaskId(use.result)
+        const subject = use.input.subject
+        if (taskId !== undefined && typeof subject === 'string') list = applyTaskEvent(list, { kind: 'created', taskId, subject }).list
+      } else if (use.tool === 'TaskUpdate') {
+        const { taskId, status, subject } = use.input
+        if (typeof taskId !== 'string') continue
+        const event: TaskEvent = { kind: 'updated', taskId }
+        if (status === 'pending' || status === 'in_progress' || status === 'completed' || status === 'deleted') event.status = status
+        if (typeof subject === 'string') event.subject = subject
+        list = applyTaskEvent(list, event).list
+      }
     }
     for (const line of parseManualLines(message.text)) {
       if (!manualLines.includes(line)) manualLines.push(line)
     }
   }
-  return { todos, manualLines }
-}
 
-/** Builds a fresh checklist from what the transcript seed found. */
-export function checklistFromSeed(seed: { todos: Todo[] | undefined; manualLines: string[] }): Checklist {
-  let list = seed.todos === undefined ? EMPTY_CHECKLIST : mergeTodos(EMPTY_CHECKLIST, seed.todos).list
-  for (const line of seed.manualLines) list = addManual(list, line).list
+  for (const line of manualLines) list = addManual(list, line).list
   return list
 }

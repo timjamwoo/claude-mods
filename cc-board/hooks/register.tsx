@@ -17,7 +17,7 @@ import type { BoardSession, Checklist, ChecklistItem } from '../types'
 import {
   EMPTY_CHECKLIST,
   addManual,
-  checklistFromSeed,
+  applyTaskEvent,
   describeChanges,
   mergeTodos,
   openItems,
@@ -26,12 +26,14 @@ import {
   seedFromTranscript,
   setTicked,
   type Change,
+  type TaskEvent,
   type Todo,
 } from './checklist'
 import {
   basename,
   boardLine,
   cheapSummary,
+  cleanPrompt,
   clip,
   fileFor,
   fullBoardText,
@@ -308,25 +310,42 @@ async function flushChanges($: EngineInterface): Promise<void> {
 
 // ---- Summary --------------------------------------------------------------
 
+/**
+ * The summary: an in-progress or pending task wins. Otherwise, with Haiku on,
+ * the last Haiku sentence stays until a new one is made (at most one call per
+ * HAIKU_GAP_MS, and only when the prompt changed); the raw prompt shows only
+ * before the first call. With Haiku off, the prompt's first line is used.
+ */
 async function refreshSummary($: EngineInterface, mayCallModel: boolean): Promise<void> {
   const list = await read($, checklist)
   const cheap = cheapSummary(list.items, lastPrompt)
   let text = cheap.text
 
-  if (!cheap.fromTodo && lastPrompt !== '') {
-    if (haikuPrompt === lastPrompt && haikuText !== '') {
-      text = haikuText
-    } else if (mayCallModel && useHaiku) {
+  if (!cheap.fromTask && useHaiku) {
+    if (mayCallModel && lastPrompt !== '' && haikuPrompt !== lastPrompt) {
       const now = await $.clock.now()
       if (now - haikuAt > HAIKU_GAP_MS) {
         haikuAt = now
         haikuPrompt = lastPrompt
-        haikuText = await askHaiku($)
-        if (haikuText !== '') text = haikuText
+        const fresh = await askHaiku($)
+        if (fresh !== '') haikuText = fresh
       }
     }
+    if (haikuText !== '') text = haikuText
   }
   await update($, summary, () => text)
+}
+
+async function applyTask($: EngineInterface, event: TaskEvent): Promise<void> {
+  let kept: ChecklistItem | undefined
+  await update($, checklist, (list: Checklist) => {
+    const result = applyTaskEvent(list, event)
+    kept = result.keptDone
+    return result.list
+  })
+  if (kept !== undefined) queueChange($, { kind: 'kept-done', item: kept })
+  await refreshSummary($, false)
+  await writeBoardFile($)
 }
 
 async function askHaiku($: EngineInterface): Promise<string> {
@@ -441,12 +460,11 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
   try {
     const messages = await $.session.messages()
     if ('deny' in messages) return 'none'
-    const seed = seedFromTranscript(messages)
-    const list = checklistFromSeed(seed)
-    if (list.items.length === 0) return 'none'
+    const list = seedFromTranscript(messages)
+    const lastUser = [...messages].reverse().find(message => message.role === 'user' && cleanPrompt(message.text) !== '')
+    lastPrompt = cleanPrompt(lastUser?.text ?? '')
+    if (list.items.length === 0 && lastPrompt === '') return 'none'
     await update($, checklist, () => list)
-    const lastUser = [...messages].reverse().find(message => message.role === 'user')
-    lastPrompt = lastUser?.text ?? ''
     await refreshSummary($, false)
     return 'transcript'
   } catch (error) {
@@ -579,6 +597,39 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // The Task tools, which newer builds use in place of TodoWrite. The call runs
+  // first, so a created task's id is known and a refused update changes nothing.
+  on('tool.call', { tool: 'TaskCreate' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (e.agentId === undefined && ran.deny === undefined) {
+      try {
+        const task = (ran.result as { task?: { id?: unknown } } | undefined)?.task
+        if (typeof task?.id === 'string') await applyTask($, { kind: 'created', taskId: task.id, subject: e.subject })
+      } catch (error) {
+        log($, `TaskCreate failed: ${String(error)}`)
+      }
+    }
+    return ran
+  })
+
+  on('tool.call', { tool: 'TaskUpdate' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (e.agentId === undefined && ran.deny === undefined) {
+      try {
+        const ok = (ran.result as { success?: unknown } | undefined)?.success !== false
+        if (ok) {
+          const event: TaskEvent = { kind: 'updated', taskId: e.taskId }
+          if (e.status !== undefined) event.status = e.status
+          if (e.subject !== undefined) event.subject = e.subject
+          await applyTask($, event)
+        }
+      } catch (error) {
+        log($, `TaskUpdate failed: ${String(error)}`)
+      }
+    }
+    return ran
+  })
+
   // Lines Claude writes that start with "MANUAL:" become manual steps.
   on('session.append', { door: 'response' }, async ($, e, next) => {
     if (e.agentId === undefined) {
@@ -595,8 +646,9 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
-    if (e.agentId === undefined && e.text.trim() !== '') {
-      lastPrompt = e.text
+    const typed = e.agentId === undefined ? cleanPrompt(e.text) : ''
+    if (typed !== '') {
+      lastPrompt = typed
       await refreshSummary($, false)
       await writeBoardFile($)
     }
@@ -664,7 +716,7 @@ export const register: Register = (on, options) => {
             {current}
           </Text>
         )}
-        {list.items.length === 0 && <Text dimColor>No items yet. Claude’s todos and /manual steps show here.</Text>}
+        {list.items.length === 0 && <Text dimColor>No tasks yet. /manual {'<text>'} adds a step of your own.</Text>}
         {list.items.map(item => (
           <Button
             key={`item-${item.id}`}
@@ -674,7 +726,7 @@ export const register: Register = (on, options) => {
             onPress={() => void toggleItem($, item.id)}
           />
         ))}
-        <Text dimColor>Click or Tab+Enter ticks an item. /done {'<id>'} works too.</Text>
+        {list.items.length > 0 && <Text dimColor>Click an item to tick it, or /done {'<id>'}.</Text>}
       </Box>
     )
   })

@@ -17,6 +17,8 @@ export type ChecklistItem = {
   status: ItemStatus
   /** True once the person ticked it themselves. A ticked item stays done. */
   ticked: boolean
+  /** The id Claude Code gave the task, for items that came from TaskCreate. */
+  taskId?: string
 }
 
 /** The checklist plus the counter that hands out ids. */
