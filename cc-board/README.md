@@ -26,6 +26,13 @@ live session in the band above the prompt: project, a one-sentence summary,
 open item count. The current session is marked with `▶`. Sessions with no
 update for 24 hours are dimmed as stale. Nothing here needs a Claude turn.
 
+**Restarts, resumes and older sessions.** A session keeps its id across a
+restart or `claude --resume`, so at startup the mod reads its own board
+file back, ticks included. A session that predates the mod has no file, so
+the mod reads the transcript instead and seeds the checklist from the last
+TodoWrite call and any `MANUAL:` lines Claude wrote. Neither sends Claude a
+note, since Claude already knows all of it.
+
 **`/board`** prints the full board: every session, its open items, and the
 `claude --resume` command to get back to it. **`/board prune`** asks, then
 removes the files of stale or ended sessions.
@@ -95,8 +102,8 @@ claude plugin test cc-board
 `validate` lists every event the mod hooks and every call it makes. `test`
 runs the files under `tests/`: the board file round trip and malformed
 files, `MANUAL:` parsing, keeping ticked items done through a TodoWrite
-update, the note sent to Claude, and the band on the terminal and desktop
-surfaces.
+update, the note sent to Claude, the band on the terminal and desktop
+surfaces, and both restore paths at startup.
 
 ## Files
 

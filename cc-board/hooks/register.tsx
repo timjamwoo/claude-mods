@@ -15,11 +15,13 @@ import type { BoardSession, Checklist, ChecklistItem } from '../types'
 import {
   EMPTY_CHECKLIST,
   addManual,
+  checklistFromSeed,
   describeChanges,
   mergeTodos,
   openItems,
   parseItemId,
   parseManualLines,
+  seedFromTranscript,
   setTicked,
   type Change,
   type Todo,
@@ -278,6 +280,47 @@ async function bindSession($: EngineInterface): Promise<void> {
   lastAnswer = ''
 }
 
+/**
+ * Fills the checklist at startup. A resumed or restarted session keeps its
+ * id, so its own board file comes back first, ticks included. With no file
+ * (a session that predates the mod), the transcript's last TodoWrite and any
+ * MANUAL: lines seed it. Claude already knows all of this, so nothing is queued.
+ */
+async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcript' | 'none'> {
+  if (boardDir !== '' && sessionId !== '') {
+    try {
+      const path = fileFor(boardDir, sessionId)
+      if (await $.fs.exists(path)) {
+        const saved = parse(await $.fs.read(path))
+        if (saved !== undefined && saved.items.length > 0) {
+          const nextId = Math.max(0, ...saved.items.map(item => item.id)) + 1
+          await update($, checklist, () => ({ items: saved.items, nextId }))
+          await update($, summary, () => saved.summary)
+          return 'file'
+        }
+      }
+    } catch (error) {
+      log($, `restore from board file failed: ${String(error)}`)
+    }
+  }
+
+  try {
+    const messages = await $.session.messages()
+    if ('deny' in messages) return 'none'
+    const seed = seedFromTranscript(messages)
+    const list = checklistFromSeed(seed)
+    if (list.items.length === 0) return 'none'
+    await update($, checklist, () => list)
+    const lastUser = [...messages].reverse().find(message => message.role === 'user')
+    lastPrompt = lastUser?.text ?? ''
+    await refreshSummary($, false)
+    return 'transcript'
+  } catch (error) {
+    log($, `seed from transcript failed: ${String(error)}`)
+    return 'none'
+  }
+}
+
 async function registerCommands($: EngineInterface): Promise<void> {
   await $.command.register({
     name: 'manual',
@@ -350,6 +393,8 @@ export const register: Register = (on, options) => {
 
     void $.ui.open({ id: PANE, title: 'cc-board' })
     $.clock.every(POLL_MS, () => refreshBoard($))
+    const restored = await restoreChecklist($)
+    if (restored !== 'none') log($, `checklist restored from ${restored}`)
     await writeBoardFile($)
     return next(e)
   })
@@ -359,6 +404,7 @@ export const register: Register = (on, options) => {
     try {
       cwd = await $.session.cwd()
       await bindSession($)
+      if (e.source !== 'clear') await restoreChecklist($)
       await writeBoardFile($)
     } catch (error) {
       log($, `rebind failed: ${String(error)}`)

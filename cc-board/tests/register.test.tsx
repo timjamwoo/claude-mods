@@ -2,7 +2,7 @@
 // beneath the plugin, so the hooks registered here stand for the engine: an
 // in-memory file system, a fixed session id, and so on.
 import { expect, mock, test } from 'claude-code/testing'
-import type { On } from 'claude-code'
+import type { On, SessionMessage } from 'claude-code'
 
 import { parse } from '../hooks/board'
 
@@ -37,7 +37,7 @@ const BAND = {
 } as const
 
 /** A fake file system that answers $.fs and the mv/rm the mod runs. */
-function fakeWorld(on: On) {
+function fakeWorld(on: On, transcript: SessionMessage[] = []) {
   const files = new Map<string, { text: string; mtimeMs: number }>()
   let tick = 0
 
@@ -50,6 +50,7 @@ function fakeWorld(on: On) {
     if (file === undefined) throw new Error(`ENOENT: ${e.path}`)
     return { value: file.text }
   })
+  on('fs.exists', (_, e) => ({ value: files.has(e.path) }))
   on('fs.list', (_, e) => {
     const prefix = `${e.path}/`
     const value = [...files.entries()]
@@ -71,8 +72,10 @@ function fakeWorld(on: On) {
     return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('ui.toast', () => ({ value: undefined }))
+  on('ui.log', () => ({ value: undefined }))
 
   on('session.id', () => ({ value: 'sess-A' }))
+  on('session.messages', () => ({ value: transcript }))
   on('session.repo', () => ({ value: null }))
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
@@ -227,4 +230,56 @@ test('the band lists every live session, marks this one and dims stale ones', as
     expect(stale?.text).toContain('stale')
     await ui.unmount()
   }
+})
+
+test('a restarted or resumed session takes its checklist back from its own board file', async ($, on) => {
+  const world = fakeWorld(on)
+  world.put(
+    `${BOARD_DIR}/sess-A.json`,
+    JSON.stringify({
+      sessionId: 'sess-A',
+      project: 'my-app',
+      cwd: '/work/my-app',
+      summary: 'Fixing login',
+      items: [
+        { id: 1, text: 'Fix login', source: 'todo', status: 'in_progress', ticked: false },
+        { id: 4, text: 'Rotate key', source: 'manual', status: 'completed', ticked: true },
+      ],
+      updatedAt: '2026-10-20T11:00:00Z',
+      endedAt: '2026-10-20T11:30:00Z',
+    }),
+  )
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ key: 'item-4' }))?.props.label).toBe('[x] #4 Rotate key (manual)')
+  await ui.unmount()
+
+  // The file is live again, and a new manual step gets the next free id.
+  const file = world.boardFile('sess-A')
+  expect(file?.endedAt).toBe(undefined)
+  expect(file?.summary).toBe('Fixing login')
+  await $.command.run({ command: 'manual', args: 'Submit build', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(world.boardFile('sess-A')?.items.map(item => item.id)).toEqual([1, 4, 5])
+})
+
+test('a session that predates the mod is seeded from its transcript, without a note to Claude', async ($, on) => {
+  const world = fakeWorld(on, [
+    { role: 'user', text: 'Fix the login crash', toolUses: [] },
+    {
+      role: 'assistant',
+      text: 'On it.\nMANUAL: Rotate the API key in the portal',
+      toolUses: [{ tool_use_id: 't1', tool: 'TodoWrite', input: { todos: [{ content: 'Fix login', status: 'in_progress', activeForm: 'Fixing login' }] } }],
+    },
+  ])
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+
+  const file = world.boardFile('sess-A')
+  expect(file?.items.map(item => [item.id, item.text, item.source])).toEqual([
+    [1, 'Fix login', 'todo'],
+    [2, 'Rotate the API key in the portal', 'manual'],
+  ])
+  expect(file?.summary).toBe('Fix login')
+  await world.clock.advance(300)
+  expect(world.noteCount()).toBe(0)
 })
