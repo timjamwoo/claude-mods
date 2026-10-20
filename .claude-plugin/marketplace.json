@@ -1,0 +1,14 @@
+{
+  "name": "claude-mods",
+  "owner": {
+    "name": "Tim Woods"
+  },
+  "description": "Claude Code mods by Tim Woods.",
+  "plugins": [
+    {
+      "name": "cc-board",
+      "source": "./cc-board",
+      "description": "Per-session checklist you tick off, plus a live board of every Claude Code session."
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "cc-board",
+  "version": "0.1.0",
+  "description": "Per-session checklist (todos + manual steps you tick off) and a live board of every Claude Code session on this machine.",
+  "author": { "name": "Tim Woods" },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "haikuSummary": {
+      "type": "boolean",
+      "title": "Haiku summary",
+      "description": "When the todo list is empty, ask Haiku for a one-sentence summary of what the session is doing (at most once per five minutes).",
+      "default": true
+    }
+  }
+}
