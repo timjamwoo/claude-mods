@@ -23,6 +23,7 @@ import {
   openItems,
   parseItemId,
   parseManualLines,
+  reconcile,
   seedFromTranscript,
   setTicked,
   type Change,
@@ -430,6 +431,9 @@ async function bindSession($: EngineInterface): Promise<void> {
   pending = []
   lastPrompt = ''
   lastAnswer = ''
+  haikuText = ''
+  haikuPrompt = ''
+  haikuAt = 0
 }
 
 /**
@@ -445,9 +449,11 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
       if (await $.fs.exists(path)) {
         const saved = parse(await $.fs.read(path))
         if (saved !== undefined) {
-          // The file is authoritative even with no items: it may still hold a summary.
+          // The file wins (ticks, manual steps, summary), topped up with any task
+          // the transcript knows and the file does not, as after an upgrade.
           const nextId = Math.max(0, ...saved.items.map(item => item.id)) + 1
-          await update($, checklist, () => ({ items: saved.items, nextId }))
+          const list = reconcile({ items: saved.items, nextId }, await replayTranscript($))
+          await update($, checklist, () => list)
           await update($, summary, () => saved.summary)
           return 'file'
         }
@@ -470,6 +476,17 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
   } catch (error) {
     log($, `seed from transcript failed: ${String(error)}`)
     return 'none'
+  }
+}
+
+/** The checklist the transcript implies, or an empty one when it cannot be read. */
+async function replayTranscript($: EngineInterface): Promise<Checklist> {
+  try {
+    const messages = await $.session.messages()
+    return 'deny' in messages ? EMPTY_CHECKLIST : seedFromTranscript(messages)
+  } catch (error) {
+    log($, `transcript replay failed: ${String(error)}`)
+    return EMPTY_CHECKLIST
   }
 }
 
@@ -657,7 +674,8 @@ export const register: Register = (on, options) => {
     const kind = e.origin.kind
     const isTyped = e.isMeta !== true && e.command === undefined && (kind === 'composer' || kind === 'bridge' || kind === 'sdk')
     if (isTyped) {
-      const typed = cleanPrompt(e.text)
+      // A typed prompt that is nothing but markup is still the person's request.
+      const typed = cleanPrompt(e.text) || (e.text.split('\n').find(line => line.trim() !== '') ?? '').trim()
       if (typed !== '') lastPrompt = typed
     }
     return next(e)

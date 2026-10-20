@@ -5,6 +5,7 @@ import {
   addManual,
   applyTaskEvent,
   describeChanges,
+  reconcile,
   mergeTodos,
   parseItemId,
   parseManualLines,
@@ -152,6 +153,7 @@ describe('seedFromTranscript', () => {
           { tool: 'TaskCreate', input: { subject: 'Add tests', description: 'd' }, result: { task: { id: 't1', subject: 'Add tests' } } },
           { tool: 'TaskCreate', input: { subject: 'Agent task', description: 'd' }, result: { task: { id: 't2', subject: 'Agent task' } }, agentId: 'agent-1' },
           { tool: 'TaskUpdate', input: { taskId: 't1', status: 'in_progress' }, result: { success: true, taskId: 't1', updatedFields: ['status'] } },
+          { tool: 'TaskUpdate', input: { taskId: 't1', status: 'completed' }, result: { success: false, taskId: 't1', updatedFields: [], error: 'blocked' } },
         ],
       },
       { role: 'assistant', text: '- MANUAL: Rotate the key\n- MANUAL: Submit the build', toolUses: [] },
@@ -162,6 +164,27 @@ describe('seedFromTranscript', () => {
       [4, 'Rotate the key', 'manual', 'pending', undefined],
       [5, 'Submit the build', 'manual', 'pending', undefined],
     ])
+  })
+
+  test('reconcile adds what the transcript knows without losing ticks or manual steps', async () => {
+    const saved = addManual(EMPTY_CHECKLIST, 'Submit build').list
+    const ticked = setTicked(saved, 1, true).list
+    const replayed = seedFromTranscript([
+      {
+        role: 'assistant',
+        text: 'MANUAL: Submit build',
+        toolUses: [
+          { tool: 'TaskCreate', input: { subject: 'Fix login', description: 'd' }, result: { task: { id: 't1', subject: 'Fix login' } } },
+          { tool: 'TaskUpdate', input: { taskId: 't1', status: 'in_progress' }, result: { success: true, taskId: 't1', updatedFields: ['status'] } },
+        ],
+      },
+    ])
+    const list = reconcile(ticked, replayed)
+    expect(list.items.map(item => [item.id, item.text, item.status, item.ticked, item.taskId])).toEqual([
+      [1, 'Submit build', 'completed', true, undefined],
+      [2, 'Fix login', 'in_progress', false, 't1'],
+    ])
+    expect(reconcile(list, replayed)).toEqual(list)
   })
 
   test('an empty or task-free transcript seeds nothing', async () => {

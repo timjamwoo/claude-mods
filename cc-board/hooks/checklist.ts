@@ -194,6 +194,34 @@ function parseTodo(value: unknown): Todo | undefined {
   return { content, status }
 }
 
+function updateFailed(result: unknown): boolean {
+  return typeof result === 'object' && result !== null && (result as { success?: unknown }).success === false
+}
+
+/**
+ * Brings a saved checklist up to date with what the transcript says: a task
+ * the transcript knows and the saved list lacks is added, a saved task that
+ * matches one by id or text keeps its tick and gains the id. Nothing saved is
+ * removed, so manual steps and ticks survive.
+ */
+export function reconcile(saved: Checklist, replayed: Checklist): Checklist {
+  let list = saved
+  for (const item of replayed.items) {
+    if (item.source === 'manual') {
+      list = addManual(list, item.text).list
+      continue
+    }
+    const known = list.items.find(one => (item.taskId !== undefined && one.taskId === item.taskId) || (one.source === 'todo' && one.text === item.text))
+    if (known === undefined) {
+      list = { items: [...list.items, { ...item, id: list.nextId }], nextId: list.nextId + 1 }
+    } else if (known.taskId === undefined && item.taskId !== undefined) {
+      const linked = { ...known, taskId: item.taskId }
+      list = { ...list, items: list.items.map(one => (one === known ? linked : one)) }
+    }
+  }
+  return list
+}
+
 function createdTaskId(result: unknown): string | undefined {
   if (typeof result !== 'object' || result === null) return undefined
   const task = (result as { task?: unknown }).task
@@ -223,6 +251,7 @@ export function seedFromTranscript(messages: readonly TranscriptMessage[]): Chec
         const subject = use.input.subject
         if (taskId !== undefined && typeof subject === 'string') list = applyTaskEvent(list, { kind: 'created', taskId, subject }).list
       } else if (use.tool === 'TaskUpdate') {
+        if (updateFailed(use.result)) continue
         const { taskId, status, subject } = use.input
         if (typeof taskId !== 'string') continue
         const event: TaskEvent = { kind: 'updated', taskId }

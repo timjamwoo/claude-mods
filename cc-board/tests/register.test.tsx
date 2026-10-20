@@ -296,6 +296,26 @@ test('a session that predates the mod is seeded from its transcript, without a n
   expect(world.noteCount()).toBe(0)
 })
 
+test('a saved file is topped up with tasks the transcript knows, keeping its ticks', async ($, on) => {
+  const world = fakeWorld(on, [
+    {
+      role: 'assistant',
+      text: 'Planned.',
+      toolUses: [{ tool_use_id: 'x', tool: 'TaskCreate', input: { subject: 'Fix login', description: 'd' }, result: { task: { id: 't1', subject: 'Fix login' } } }],
+    },
+  ])
+  world.put(
+    `${BOARD_DIR}/sess-A.json`,
+    JSON.stringify({ sessionId: 'sess-A', project: 'my-app', cwd: '/work/my-app', summary: 'Fixing login', items: [{ id: 1, text: 'Rotate key', source: 'manual', status: 'completed', ticked: true }], updatedAt: '2026-10-20T11:00:00Z' }),
+  )
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  expect(world.boardFile('sess-A')?.items.map(item => [item.id, item.text, item.status, item.ticked, item.taskId])).toEqual([
+    [1, 'Rotate key', 'completed', true, undefined],
+    [2, 'Fix login', 'pending', false, 't1'],
+  ])
+  expect(world.boardFile('sess-A')?.summary).toBe('Fixing login')
+})
+
 test('a board file with no items still restores its saved summary', async ($, on) => {
   const world = fakeWorld(on, [{ role: 'user', text: 'Rotate the signing key', toolUses: [] }])
   world.put(
