@@ -51,6 +51,11 @@ export function parse(text: string): BoardSession | undefined {
   } catch {
     return undefined
   }
+  return parseValue(raw)
+}
+
+/** As `parse`, for a value already decoded from JSON. */
+export function parseValue(raw: unknown): BoardSession | undefined {
   if (!isRecord(raw)) return undefined
   const { sessionId, project, cwd, summary, items, updatedAt, endedAt, machine } = raw
   if (typeof sessionId !== 'string' || sessionId === '') return undefined

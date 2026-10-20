@@ -12,16 +12,16 @@
       "description": "When the todo list is empty, ask Haiku for a one-sentence summary of what the session is doing (at most once per five minutes).",
       "default": true
     },
-    "boardGist": {
+    "boardUrl": {
       "type": "string",
-      "title": "Board gist id",
-      "description": "Id of a secret GitHub gist that holds one file per session, so every machine sees one board. Empty keeps the board local. Also read from CC_BOARD_GIST.",
+      "title": "Shared board URL",
+      "description": "The Supabase project URL whose cc_board table holds one row per session, so every machine and cloud session sees one board. Empty keeps the board local. Also read from CC_BOARD_URL.",
       "default": ""
     },
-    "boardToken": {
+    "boardKey": {
       "type": "string",
-      "title": "Board gist token",
-      "description": "A GitHub token with the gist scope, used only to read and write that gist. Also read from CC_BOARD_TOKEN.",
+      "title": "Shared board key",
+      "description": "A secret key of that project, used only to read and write cc_board. Also read from CC_BOARD_KEY.",
       "sensitive": true
     }
   }

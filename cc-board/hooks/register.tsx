@@ -4,7 +4,7 @@
 //   - keeps this session's checklist (TodoWrite items + manual steps) in $.state
 //   - writes it to ~/.claude/board/<session-id>.json after every change
 //   - polls that folder and draws every live session in the band above the prompt
-//   - optionally mirrors the same document to a secret GitHub gist (one file per
+//   - optionally mirrors the same document to a Supabase table (one row per
 //     session), so sessions on other machines and in the cloud share one board
 //   - draws the checklist as buttons in a pane, and tells Claude what you ticked
 //
@@ -45,7 +45,7 @@ import {
   serialize,
   sortSessions,
 } from './board'
-import { gistFileName, gistHeaders, gistPatchBody, gistUrl, parseGistFiles } from './gist'
+import { deleteUrl, parseRows, readUrl, sharedHeaders, tableUrl, upsertBody, upsertHeaders } from './shared'
 
 const PANE = 'cc-board'
 const POLL_MS = 2000
@@ -69,13 +69,12 @@ let project = ''
 let machine = ''
 let boardDir = ''
 
-// The shared gist, when configured. `remoteEtag` makes unchanged polls free.
-let gistId = ''
-let gistToken = ''
-let remoteEtag = ''
+// The shared table, when configured.
+let boardUrl = ''
+let boardKey = ''
 let remoteFailures = 0
 let pushTimer: Timer | undefined
-let pendingPush = ''
+let pendingPush: BoardSession | undefined
 let lastPushed = ''
 
 // What the summary is derived from.
@@ -92,12 +91,12 @@ let flushTimer: Timer | undefined
 // The board files as last read: name -> mtime, and name -> parsed session.
 const seenMtime = new Map<string, number>()
 const sessions = new Map<string, BoardSession>()
-// The gist's sessions as last read, by file name.
+// The shared table's sessions as last read, by session id.
 const remoteSessions = new Map<string, BoardSession>()
 let boardSignature = ''
 
 function isRemoteConfigured(): boolean {
-  return gistId !== '' && gistToken !== ''
+  return boardUrl !== '' && boardKey !== ''
 }
 
 function log($: EngineInterface, text: string): void {
@@ -129,7 +128,7 @@ async function writeBoardFile($: EngineInterface, endedAt?: string): Promise<voi
     const moved = await $.process.run(['mv', '-f', temp, target], { timeoutMs: 5000 })
     if (moved.exitCode !== 0) log($, `mv failed: ${moved.stderr}`)
     await refreshBoard($)
-    schedulePush($, serialize(snapshot), endedAt !== undefined)
+    schedulePush($, snapshot, endedAt !== undefined)
   } catch (error) {
     log($, `board write failed: ${String(error)}`)
   }
@@ -187,16 +186,16 @@ async function publishBoard($: EngineInterface, changed: boolean): Promise<void>
   if (changed) await update($, board, () => merged)
 }
 
-// ---- Shared board in a gist -----------------------------------------------
+// ---- Shared board in a Supabase table --------------------------------------
 
 async function configureRemote($: EngineInterface): Promise<void> {
   const option = (name: string) => {
     const value = pluginOptions[name]
     return typeof value === 'string' ? value.trim() : ''
   }
-  gistId = option('boardGist') || ((await $.env.get('CC_BOARD_GIST')) ?? '').trim()
-  gistToken = option('boardToken') || ((await $.env.get('CC_BOARD_TOKEN')) ?? '').trim()
-  if (gistId !== '' && gistToken === '') log($, 'boardGist is set but no token: the board stays local')
+  boardUrl = option('boardUrl') || ((await $.env.get('CC_BOARD_URL')) ?? '').trim()
+  boardKey = option('boardKey') || ((await $.env.get('CC_BOARD_KEY')) ?? '').trim()
+  if (boardUrl !== '' && boardKey === '') log($, 'boardUrl is set but no key: the board stays local')
 }
 
 /** A short label for where this session runs: "cloud", or the host name. */
@@ -214,14 +213,14 @@ async function detectMachine($: EngineInterface): Promise<string> {
 
 function remoteFailed($: EngineInterface, what: string, status: number | string): void {
   remoteFailures += 1
-  log($, `gist ${what} failed: ${status}`)
+  log($, `shared board ${what} failed: ${status}`)
   if (remoteFailures === 1) $.ui.toast(`shared board: ${what} failed (${status}), see the debug log`)
 }
 
-/** Writes this session's file to the gist, a little after the last local write, and only when it changed. */
-function schedulePush($: EngineInterface, text: string, atOnce: boolean): void {
+/** Writes this session's row, a little after the last local write, and only when it changed. */
+function schedulePush($: EngineInterface, snapshot: BoardSession, atOnce: boolean): void {
   if (!isRemoteConfigured()) return
-  pendingPush = text
+  pendingPush = snapshot
   pushTimer?.cancel()
   if (atOnce) {
     void pushRemote($)
@@ -231,16 +230,13 @@ function schedulePush($: EngineInterface, text: string, atOnce: boolean): void {
 }
 
 async function pushRemote($: EngineInterface): Promise<void> {
-  if (!isRemoteConfigured() || pendingPush === '' || pendingPush === lastPushed) return
-  const text = pendingPush
+  if (!isRemoteConfigured() || pendingPush === undefined) return
+  const body = upsertBody(pendingPush)
+  if (body === lastPushed) return
   try {
-    const response = await $.http.fetch(gistUrl(gistId), {
-      method: 'PATCH',
-      headers: { ...gistHeaders(gistToken), 'content-type': 'application/json' },
-      body: gistPatchBody({ [gistFileName(sessionId)]: text }),
-    })
+    const response = await $.http.fetch(tableUrl(boardUrl), { method: 'POST', headers: upsertHeaders(boardKey), body })
     if (response.ok) {
-      lastPushed = text
+      lastPushed = body
       remoteFailures = 0
     } else {
       remoteFailed($, 'write', response.status)
@@ -253,35 +249,27 @@ async function pushRemote($: EngineInterface): Promise<void> {
 async function pullRemote($: EngineInterface): Promise<void> {
   if (!isRemoteConfigured()) return
   try {
-    const response = await $.http.fetch(gistUrl(gistId), { headers: gistHeaders(gistToken, remoteEtag) })
-    if (response.status === 304) return
+    const response = await $.http.fetch(readUrl(boardUrl), { headers: sharedHeaders(boardKey) })
     if (!response.ok) {
       remoteFailed($, 'read', response.status)
       return
     }
-    remoteEtag = response.headers['etag'] ?? ''
     remoteFailures = 0
     remoteSessions.clear()
-    for (const session of parseGistFiles(response.text)) remoteSessions.set(gistFileName(session.sessionId), session)
+    for (const session of parseRows(response.text)) remoteSessions.set(session.sessionId, session)
     await publishBoard($, true)
   } catch (error) {
     remoteFailed($, 'read', String(error))
   }
 }
 
-/** Deletes the named files from the gist. Resolves false when the request failed. */
-async function deleteRemote($: EngineInterface, names: readonly string[]): Promise<boolean> {
-  if (!isRemoteConfigured() || names.length === 0) return true
-  const files: Record<string, null> = {}
-  for (const name of names) files[name] = null
+/** Deletes the named sessions' rows. Resolves false when the request failed. */
+async function deleteRemote($: EngineInterface, sessionIds: readonly string[]): Promise<boolean> {
+  if (!isRemoteConfigured() || sessionIds.length === 0) return true
   try {
-    const response = await $.http.fetch(gistUrl(gistId), {
-      method: 'PATCH',
-      headers: { ...gistHeaders(gistToken), 'content-type': 'application/json' },
-      body: gistPatchBody(files),
-    })
+    const response = await $.http.fetch(deleteUrl(boardUrl, sessionIds), { method: 'DELETE', headers: sharedHeaders(boardKey) })
     if (!response.ok) remoteFailed($, 'prune', response.status)
-    else for (const name of names) remoteSessions.delete(name)
+    else for (const id of sessionIds) remoteSessions.delete(id)
     return response.ok
   } catch (error) {
     remoteFailed($, 'prune', String(error))
@@ -524,16 +512,18 @@ async function pruneBoard($: EngineInterface): Promise<string> {
     .catch(() => 'Keep')
   if (answer !== 'Remove') return 'cc-board: kept everything.'
 
-  const names = stale.map(session => gistFileName(session.sessionId))
-  const localPaths = names.filter(name => sessions.has(name)).map(name => `${boardDir}/${name}`)
+  const localPaths = stale
+    .map(session => `${session.sessionId}.json`)
+    .filter(name => sessions.has(name))
+    .map(name => `${boardDir}/${name}`)
   if (localPaths.length > 0) {
     const removed = await $.process.run(['rm', '-f', ...localPaths], { timeoutMs: 5000 })
     if (removed.exitCode !== 0) return `cc-board: rm failed: ${removed.stderr}`
   }
-  const remoteNames = names.filter(name => remoteSessions.has(name))
-  const remoteOk = await deleteRemote($, remoteNames)
+  const remoteIds = stale.map(session => session.sessionId).filter(id => remoteSessions.has(id))
+  const remoteOk = await deleteRemote($, remoteIds)
   await refreshBoard($)
-  const where = remoteNames.length > 0 ? ` (${remoteNames.length} from the shared gist${remoteOk ? '' : ', which failed'})` : ''
+  const where = remoteIds.length > 0 ? ` (${remoteIds.length} from the shared board${remoteOk ? '' : ', which failed'})` : ''
   return `cc-board: removed ${stale.length} session(s)${where}.`
 }
 

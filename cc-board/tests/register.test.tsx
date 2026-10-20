@@ -73,7 +73,11 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
     const stdout = command === 'hostname' ? 'mbp\n' : ''
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  on('ui.toast', () => ({ value: undefined }))
+  const toasts: string[] = []
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
   on('ui.log', () => ({ value: undefined }))
 
   on('session.id', () => ({ value: 'sess-A' }))
@@ -112,7 +116,7 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
   }
   const noteCount = () => session.appended().filter(one => one.door === 'note').length
 
-  return { files, clock, session, boardFile, put, lastNote, noteCount }
+  return { files, clock, session, boardFile, put, lastNote, noteCount, toasts }
 }
 
 const TODOS = [
@@ -327,54 +331,60 @@ test('a board file with no items still restores its saved summary', async ($, on
   expect(world.boardFile('sess-A')?.items).toEqual([])
 })
 
-/** A fake GitHub gist: records every request and serves the files it holds. */
-function fakeGist(on: On, files: Record<string, string>) {
-  const calls: { method: string; status: number; headers: Record<string, string> }[] = []
-  const gist = { files: { ...files } }
-  let etag = 'W/"1"'
+/** A fake cc_board table behind the Supabase REST API: records every request and serves its rows. */
+function fakeTable(on: On, rows: Record<string, unknown>) {
+  const calls: { method: string; url: string; status: number; headers: Record<string, string>; body?: string }[] = []
+  const table = new Map(Object.entries(rows))
   on('http.fetch', (_, e) => {
     const method = e.init?.method ?? 'GET'
     const headers = e.init?.headers ?? {}
-    const call = { method, status: 200, headers }
+    const call = { method, url: e.url, status: 200, headers, body: e.init?.body }
     calls.push(call)
+    if (headers.apikey !== 'secret') {
+      call.status = 401
+      return { value: { status: 401, ok: false, headers: {}, text: '{"message":"Invalid API key"}' } }
+    }
     if (method === 'GET') {
-      if (headers['if-none-match'] === etag) {
-        call.status = 304
-        return { value: { status: 304, ok: false, headers: { etag }, text: '' } }
-      }
-      const body = { files: Object.fromEntries(Object.entries(gist.files).map(([name, content]) => [name, { content, truncated: false }])) }
-      return { value: { status: 200, ok: true, headers: { etag }, text: JSON.stringify(body) } }
+      const text = JSON.stringify([...table.values()].map(payload => ({ payload })))
+      return { value: { status: 200, ok: true, headers: {}, text } }
     }
-    const patch = JSON.parse(e.init?.body ?? '{}') as { files: Record<string, { content: string } | null> }
-    for (const [name, file] of Object.entries(patch.files)) {
-      if (file === null) delete gist.files[name]
-      else gist.files[name] = file.content
+    if (method === 'POST') {
+      for (const row of JSON.parse(e.init?.body ?? '[]') as { session_id: string; payload: unknown }[]) table.set(row.session_id, row.payload)
+      call.status = 201
+      return { value: { status: 201, ok: true, headers: {}, text: '' } }
     }
-    etag = `W/"${calls.length + 1}"`
-    return { value: { status: 200, ok: true, headers: { etag }, text: '{}' } }
+    if (method === 'DELETE') {
+      const match = /session_id=in\.\((.*)\)$/.exec(decodeURIComponent(e.url))
+      for (const id of (match?.[1] ?? '').split(',').map(one => one.replace(/"/g, ''))) table.delete(id)
+      call.status = 204
+      return { value: { status: 204, ok: true, headers: {}, text: '' } }
+    }
+    call.status = 405
+    return { value: { status: 405, ok: false, headers: {}, text: '' } }
   })
-  return { calls, gist }
+  return { calls, table }
 }
 
-const OPTIONS = { options: { boardGist: 'gist123', boardToken: 'tok' } }
+const OPTIONS = { options: { boardUrl: 'https://proj.supabase.co', boardKey: 'secret' } }
 
-test('with a gist configured, this session’s file is mirrored there after a short pause', { ...OPTIONS }, async ($, on) => {
+test('with a shared board configured, this session’s row is upserted after a short pause', { ...OPTIONS }, async ($, on) => {
   const world = fakeWorld(on)
-  const remote = fakeGist(on, {})
+  const remote = fakeTable(on, {})
   await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
   await $.tool.call({ tool: 'TodoWrite', todos: [...TODOS] })
   await world.clock.advance(2000)
 
-  const patches = remote.calls.filter(call => call.method === 'PATCH')
-  expect(patches.length).toBe(1)
-  expect(patches[0]?.headers.authorization).toBe('Bearer tok')
-  const mirrored = parse(remote.gist.files['sess-A.json'] ?? '')
+  const writes = remote.calls.filter(call => call.method === 'POST')
+  expect(writes.length).toBe(1)
+  expect(writes[0]?.url).toBe('https://proj.supabase.co/rest/v1/cc_board')
+  expect(writes[0]?.headers.prefer).toContain('merge-duplicates')
+  const mirrored = parse(JSON.stringify(remote.table.get('sess-A')))
   expect(mirrored?.items.map(item => item.text)).toEqual(['Fix login', 'Rotate key'])
   expect(mirrored?.machine).toBe('mbp')
-  expect(remote.gist.files['sess-A.json']).toBe(world.files.get(`${BOARD_DIR}/sess-A.json`)?.text)
+  expect(JSON.stringify(remote.table.get('sess-A'))).toBe(JSON.stringify(JSON.parse(world.files.get(`${BOARD_DIR}/sess-A.json`)?.text ?? '')))
 })
 
-test('sessions from the gist join the band, polls reuse the etag, and prune deletes from both stores', { ...OPTIONS }, async ($, on) => {
+test('sessions from the shared board join the band, and prune deletes from both stores', { ...OPTIONS }, async ($, on) => {
   const world = fakeWorld(on)
   const cloud = {
     sessionId: 'sess-cloud',
@@ -386,7 +396,7 @@ test('sessions from the gist join the band, polls reuse the etag, and prune dele
     machine: 'cloud',
   }
   const old = { ...cloud, sessionId: 'sess-old', project: 'old-repo', updatedAt: '2026-10-10T11:55:00Z' }
-  const remote = fakeGist(on, { 'sess-cloud.json': JSON.stringify(cloud), 'sess-old.json': JSON.stringify(old) })
+  const remote = fakeTable(on, { 'sess-cloud': cloud, 'sess-old': old })
 
   await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
   await world.clock.advance(15000)
@@ -396,16 +406,19 @@ test('sessions from the gist join the band, polls reuse the etag, and prune dele
   expect((await ui.find({ type: 'Text', text: /old-repo/ }))?.props.dimColor).toBe(true)
   await ui.unmount()
 
-  // Nothing changed on the gist since the last read, so the next poll sends the etag and is answered 304.
-  const before = remote.calls.length
-  await world.clock.advance(15000)
-  const polls = remote.calls.slice(before).filter(call => call.method === 'GET')
-  expect(polls.length).toBe(1)
-  expect(polls[0]?.status).toBe(304)
-
   const result = await $.command.run({ command: 'board', args: 'prune', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
-  expect(result?.text).toContain('removed 1 session(s) (1 from the shared gist)')
-  expect(Object.keys(remote.gist.files).sort()).toEqual(['sess-A.json', 'sess-cloud.json'])
+  expect(result?.text).toContain('removed 1 session(s) (1 from the shared board)')
+  expect([...remote.table.keys()].sort()).toEqual(['sess-A', 'sess-cloud'])
+})
+
+test('a refused key shows one toast and leaves the local board working', { options: { boardUrl: 'https://proj.supabase.co', boardKey: 'wrong' } }, async ($, on) => {
+  const world = fakeWorld(on)
+  fakeTable(on, {})
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'TodoWrite', todos: [...TODOS] })
+  await world.clock.advance(15000)
+  expect(world.toasts.filter(text => text.startsWith('shared board')).length).toBe(1)
+  expect(world.boardFile('sess-A')?.items.length).toBe(2)
 })
 
 test('TaskCreate and TaskUpdate drive the checklist, and a ticked task survives a reopen', async ($, on) => {
