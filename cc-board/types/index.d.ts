@@ -37,6 +37,8 @@ export type BoardSession = {
   updatedAt: string
   /** ISO 8601 time the session ended, once it has. */
   endedAt?: string
+  /** Where the session runs: a short host name, or "cloud". */
+  machine?: string
 }
 
 declare module 'claude-code' {

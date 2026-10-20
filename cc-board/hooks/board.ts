@@ -50,7 +50,7 @@ export function parse(text: string): BoardSession | undefined {
     return undefined
   }
   if (!isRecord(raw)) return undefined
-  const { sessionId, project, cwd, summary, items, updatedAt, endedAt } = raw
+  const { sessionId, project, cwd, summary, items, updatedAt, endedAt, machine } = raw
   if (typeof sessionId !== 'string' || sessionId === '') return undefined
   if (typeof project !== 'string' || typeof cwd !== 'string') return undefined
   if (typeof updatedAt !== 'string' || Number.isNaN(Date.parse(updatedAt))) return undefined
@@ -64,7 +64,21 @@ export function parse(text: string): BoardSession | undefined {
     updatedAt,
   }
   if (typeof endedAt === 'string') session.endedAt = endedAt
+  if (typeof machine === 'string' && machine !== '') session.machine = machine
   return session
+}
+
+/**
+ * Local files and the shared gist, one entry per session id: when both hold
+ * a session, the newer `updatedAt` wins.
+ */
+export function mergeSessions(local: readonly BoardSession[], remote: readonly BoardSession[]): BoardSession[] {
+  const byId = new Map<string, BoardSession>()
+  for (const session of [...remote, ...local]) {
+    const known = byId.get(session.sessionId)
+    if (known === undefined || Date.parse(session.updatedAt) >= Date.parse(known.updatedAt)) byId.set(session.sessionId, session)
+  }
+  return [...byId.values()]
 }
 
 export function isStale(session: BoardSession, nowMs: number): boolean {
@@ -102,13 +116,17 @@ function age(session: BoardSession, nowMs: number): string {
   return `${Math.round(hours / 24)}d`
 }
 
-/** One band line: a marker, the project, the summary and the open count. */
-export function boardLine(session: BoardSession, isCurrent: boolean, nowMs: number): string {
+/**
+ * One band line: a marker, the project, the summary and the open count. A
+ * session on another machine than `homeMachine` is tagged with its machine.
+ */
+export function boardLine(session: BoardSession, isCurrent: boolean, nowMs: number, homeMachine?: string): string {
   const open = openItems(session.items).length
   const marker = isCurrent ? '▶' : ' '
   const summary = session.summary === '' ? '(no summary yet)' : session.summary
+  const where = session.machine !== undefined && session.machine !== homeMachine ? ` · @${session.machine}` : ''
   const stale = isStale(session, nowMs) ? ` · stale ${age(session, nowMs)}` : ''
-  return `${marker} ${session.project} · ${summary} · ${open} open${stale}`
+  return `${marker} ${session.project} · ${summary} · ${open} open${where}${stale}`
 }
 
 /** Current session first, then the rest by most recent update. */
@@ -127,7 +145,7 @@ function mark(item: ChecklistItem): string {
 }
 
 /** What /board prints: every session, its open items and how to resume it. */
-export function fullBoardText(sessions: readonly BoardSession[], currentId: string, nowMs: number): string {
+export function fullBoardText(sessions: readonly BoardSession[], currentId: string, nowMs: number, homeMachine?: string): string {
   if (sessions.length === 0) return 'cc-board: no sessions on the board yet.'
   const lines: string[] = [`cc-board · ${sessions.length} session(s)`, '']
   for (const session of sortSessions(sessions, currentId)) {
@@ -136,13 +154,14 @@ export function fullBoardText(sessions: readonly BoardSession[], currentId: stri
     if (session.endedAt !== undefined) flags.push('ended')
     else if (isStale(session, nowMs)) flags.push(`stale, ${age(session, nowMs)}`)
     const suffix = flags.length > 0 ? `  (${flags.join(', ')})` : ''
-    lines.push(boardLine(session, session.sessionId === currentId, nowMs).trimStart() + suffix)
+    lines.push(boardLine(session, session.sessionId === currentId, nowMs, homeMachine).trimStart() + suffix)
     for (const item of openItems(session.items)) {
       const source = item.source === 'manual' ? ' (manual)' : ''
       lines.push(`    ${mark(item)} #${item.id} ${item.text}${source}`)
     }
     lines.push(`    cwd: ${session.cwd}`)
-    lines.push(`    resume: cd ${session.cwd} && claude --resume ${session.sessionId}`)
+    const elsewhere = session.machine !== undefined && session.machine !== homeMachine ? `  (on ${session.machine})` : ''
+    lines.push(`    resume: cd ${session.cwd} && claude --resume ${session.sessionId}${elsewhere}`)
     lines.push('')
   }
   return lines.join('\n').trimEnd()

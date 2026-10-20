@@ -69,7 +69,8 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
       }
     }
     if (command === 'rm') for (const path of args.slice(1)) files.delete(path)
-    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    const stdout = command === 'hostname' ? 'mbp\n' : ''
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('ui.toast', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
@@ -80,7 +81,15 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('tool.call', () => ({ result: {} }))
+  on('tool.call', (_, e) => {
+    // $.ui.ask reaches the test as an AskUserQuestion call: answer "Remove" to every question.
+    if (e.tool === 'AskUserQuestion') {
+      const answers: Record<string, string> = {}
+      for (const question of e.questions) answers[question.question] = 'Remove'
+      return { result: { questions: e.questions, answers } }
+    }
+    return { result: {} }
+  })
   mock.env(on, { HOME })
 
   const clock = mock.clock(on, { now: Date.parse('2026-10-20T12:00:00Z') })
@@ -293,4 +302,85 @@ test('a board file with no items still restores its saved summary', async ($, on
   await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
   expect(world.boardFile('sess-A')?.summary).toBe('Rotating the signing key')
   expect(world.boardFile('sess-A')?.items).toEqual([])
+})
+
+/** A fake GitHub gist: records every request and serves the files it holds. */
+function fakeGist(on: On, files: Record<string, string>) {
+  const calls: { method: string; status: number; headers: Record<string, string> }[] = []
+  const gist = { files: { ...files } }
+  let etag = 'W/"1"'
+  on('http.fetch', (_, e) => {
+    const method = e.init?.method ?? 'GET'
+    const headers = e.init?.headers ?? {}
+    const call = { method, status: 200, headers }
+    calls.push(call)
+    if (method === 'GET') {
+      if (headers['if-none-match'] === etag) {
+        call.status = 304
+        return { value: { status: 304, ok: false, headers: { etag }, text: '' } }
+      }
+      const body = { files: Object.fromEntries(Object.entries(gist.files).map(([name, content]) => [name, { content, truncated: false }])) }
+      return { value: { status: 200, ok: true, headers: { etag }, text: JSON.stringify(body) } }
+    }
+    const patch = JSON.parse(e.init?.body ?? '{}') as { files: Record<string, { content: string } | null> }
+    for (const [name, file] of Object.entries(patch.files)) {
+      if (file === null) delete gist.files[name]
+      else gist.files[name] = file.content
+    }
+    etag = `W/"${calls.length + 1}"`
+    return { value: { status: 200, ok: true, headers: { etag }, text: '{}' } }
+  })
+  return { calls, gist }
+}
+
+const OPTIONS = { options: { boardGist: 'gist123', boardToken: 'tok' } }
+
+test('with a gist configured, this session’s file is mirrored there after a short pause', { ...OPTIONS }, async ($, on) => {
+  const world = fakeWorld(on)
+  const remote = fakeGist(on, {})
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'TodoWrite', todos: [...TODOS] })
+  await world.clock.advance(2000)
+
+  const patches = remote.calls.filter(call => call.method === 'PATCH')
+  expect(patches.length).toBe(1)
+  expect(patches[0]?.headers.authorization).toBe('Bearer tok')
+  const mirrored = parse(remote.gist.files['sess-A.json'] ?? '')
+  expect(mirrored?.items.map(item => item.text)).toEqual(['Fix login', 'Rotate key'])
+  expect(mirrored?.machine).toBe('mbp')
+  expect(remote.gist.files['sess-A.json']).toBe(world.files.get(`${BOARD_DIR}/sess-A.json`)?.text)
+})
+
+test('sessions from the gist join the band, polls reuse the etag, and prune deletes from both stores', { ...OPTIONS }, async ($, on) => {
+  const world = fakeWorld(on)
+  const cloud = {
+    sessionId: 'sess-cloud',
+    project: 'other-repo',
+    cwd: '/work/other-repo',
+    summary: 'Adding the settings page',
+    items: [{ id: 1, text: 'Add settings page', source: 'todo', status: 'pending', ticked: false }],
+    updatedAt: '2026-10-20T11:55:00Z',
+    machine: 'cloud',
+  }
+  const old = { ...cloud, sessionId: 'sess-old', project: 'old-repo', updatedAt: '2026-10-10T11:55:00Z' }
+  const remote = fakeGist(on, { 'sess-cloud.json': JSON.stringify(cloud), 'sess-old.json': JSON.stringify(old) })
+
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  await world.clock.advance(15000)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /other-repo/ }))?.text).toBe('  other-repo · Adding the settings page · 1 open · @cloud')
+  expect((await ui.find({ type: 'Text', text: /old-repo/ }))?.props.dimColor).toBe(true)
+  await ui.unmount()
+
+  // Nothing changed on the gist since the last read, so the next poll sends the etag and is answered 304.
+  const before = remote.calls.length
+  await world.clock.advance(15000)
+  const polls = remote.calls.slice(before).filter(call => call.method === 'GET')
+  expect(polls.length).toBe(1)
+  expect(polls[0]?.status).toBe(304)
+
+  const result = await $.command.run({ command: 'board', args: 'prune', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(result?.text).toContain('removed 1 session(s) (1 from the shared gist)')
+  expect(Object.keys(remote.gist.files).sort()).toEqual(['sess-A.json', 'sess-cloud.json'])
 })
