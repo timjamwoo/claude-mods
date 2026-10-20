@@ -92,7 +92,7 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
     if (e.tool === 'TaskUpdate') return { result: { success: true, taskId: e.taskId, updatedFields: ['status'] } }
     if (e.tool === 'AskUserQuestion') {
       const answers: Record<string, string> = {}
-      for (const question of e.questions) answers[question.question] = 'Remove'
+      for (const question of e.questions) answers[question.question] = question.options[0]?.label ?? 'Remove'
       return { result: { questions: e.questions, answers } }
     }
     return { result: {} }
@@ -549,4 +549,33 @@ test('a completed turn that mentions something for later puts it on the checklis
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ key: 'item-1' }))?.props.label).toBe('[ ] #1 Rotate the API key in the portal (loose end)')
   await ui.unmount()
+
+  // A loose end at the far end of a long reply still reaches the scan.
+  const long = `${'The parser now handles nested groups. '.repeat(250)}Also, remember to renew the signing certificate.`
+  await $.prompt.submit({ text: 'and the parser?', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'and the parser?', turnId: 't4' })
+  await $.turn.complete({ turnId: 't4', answer: long, durationMs: 10, isAborted: false, reason: 'answer' })
+  const scans = asked.filter(prompt => prompt.startsWith('Already on the checklist'))
+  expect(scans.length).toBe(3)
+  expect(scans[2]).toContain('renew the signing certificate')
+})
+
+test('/board prune sweeps rows hidden behind the read cap even when nothing stale is listed', { ...OPTIONS }, async ($, on) => {
+  const world = fakeWorld(on)
+  const rows: Record<string, unknown> = {}
+  for (let i = 0; i < 500; i += 1) {
+    rows[`sess-recent-${i}`] = { sessionId: `sess-recent-${i}`, project: 'p', cwd: '/w', summary: '', items: [], updatedAt: `2026-10-20T11:${String(i % 60).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}Z` }
+  }
+  for (let i = 0; i < 20; i += 1) {
+    rows[`sess-ancient-${i}`] = { sessionId: `sess-ancient-${i}`, project: 'p', cwd: '/w', summary: '', items: [], updatedAt: `2026-09-${String(1 + i).padStart(2, '0')}T00:00:00Z` }
+  }
+  const remote = fakeTable(on, rows)
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  await world.clock.advance(15000)
+  expect(remote.table.size).toBe(521)
+
+  const result = await $.command.run({ command: 'board', args: 'prune', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(result?.text).toContain('swept')
+  expect([...remote.table.keys()].some(id => id.startsWith('sess-ancient'))).toBe(false)
+  expect(remote.table.size).toBe(501)
 })

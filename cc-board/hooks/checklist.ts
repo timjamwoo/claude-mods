@@ -127,6 +127,25 @@ export function hasLooseEndCue(text: string): boolean {
 }
 
 /**
+ * What a scan reads of a long exchange: the whole text when it fits, else
+ * the passages around every cue, with `radius` characters of context each
+ * side, merged where they overlap. Past `max`, the latest passages are kept.
+ */
+export function cueExcerpts(text: string, max = 6000, radius = 600): string {
+  if (text.length <= max) return text
+  const windows: [number, number][] = []
+  for (const match of text.matchAll(new RegExp(LOOSE_END_CUE.source, 'gi'))) {
+    const start = Math.max(0, match.index - radius)
+    const end = Math.min(text.length, match.index + match[0].length + radius)
+    const last = windows[windows.length - 1]
+    if (last !== undefined && start <= last[1]) last[1] = Math.max(last[1], end)
+    else windows.push([start, end])
+  }
+  const joined = windows.map(([start, end]) => text.slice(start, end)).join('\n…\n')
+  return joined.length <= max ? joined : joined.slice(joined.length - max)
+}
+
+/**
  * The loose ends a model listed, one per line: bullets and numbering
  * stripped, NONE and empty lines dropped, repeats and over-long lines removed.
  */

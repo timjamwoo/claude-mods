@@ -19,6 +19,7 @@ import {
   addFollowUp,
   addManual,
   applyTaskEvent,
+  cueExcerpts,
   describeChanges,
   hasLooseEndCue,
   mergeTodos,
@@ -443,7 +444,7 @@ async function extractFollowUps($: EngineInterface, text: string): Promise<strin
       model: 'haiku',
       system:
         'You keep a checklist for a developer so nothing said in passing is forgotten. Read the exchange and list only loose ends: things someone said should happen later, must be done by hand, were deferred or skipped for now, or were asked for and not done. Do not list work the reply says is finished, and do not list anything already on the checklist. One per line, imperative, at most twelve words, at most five lines, no numbering, no commentary. If there is nothing, reply NONE.',
-      prompt: `Already on the checklist:\n${open === '' ? '(nothing)' : open}\n\nExchange:\n${clip(text, 6000)}`,
+      prompt: `Already on the checklist:\n${open === '' ? '(nothing)' : open}\n\nExchange:\n${cueExcerpts(text)}`,
       maxTokens: 160,
       effort: 'low',
       timeoutMs: 10000,
@@ -506,9 +507,11 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
           // The file wins (ticks, manual steps, summary), topped up with any task
           // the transcript knows and the file does not, as after an upgrade.
           const nextId = Math.max(0, ...saved.items.map(item => item.id)) + 1
-          const list = reconcile({ items: saved.items, nextId }, await replayTranscript($))
+          const replayed = await replayTranscript($)
+          const list = reconcile({ items: saved.items, nextId }, replayed.list)
           await update($, checklist, () => list)
           await update($, summary, () => saved.summary)
+          if (lastPrompt === '') lastPrompt = replayed.lastPrompt
           return 'file'
         }
       }
@@ -528,7 +531,7 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
     await refreshSummary($, false)
     // One scan of the recent conversation for loose ends mentioned before the mod loaded.
     const recent = messages.slice(-30).map(message => `${message.role === 'user' ? 'User' : 'Claude'}: ${cleanPrompt(message.text)}`).join('\n\n')
-    await surfaceFollowUps($, recent.slice(-6000))
+    await surfaceFollowUps($, recent)
     return 'transcript'
   } catch (error) {
     log($, `seed from transcript failed: ${String(error)}`)
@@ -536,14 +539,16 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
   }
 }
 
-/** The checklist the transcript implies, or an empty one when it cannot be read. */
-async function replayTranscript($: EngineInterface): Promise<Checklist> {
+/** The checklist the transcript implies and the last prompt a person typed, or empty when it cannot be read. */
+async function replayTranscript($: EngineInterface): Promise<{ list: Checklist; lastPrompt: string }> {
   try {
     const messages = await $.session.messages()
-    return 'deny' in messages ? EMPTY_CHECKLIST : seedFromTranscript(messages)
+    if ('deny' in messages) return { list: EMPTY_CHECKLIST, lastPrompt: '' }
+    const lastUser = [...messages].reverse().find(message => message.role === 'user' && cleanPrompt(message.text) !== '')
+    return { list: seedFromTranscript(messages), lastPrompt: cleanPrompt(lastUser?.text ?? '') }
   } catch (error) {
     log($, `transcript replay failed: ${String(error)}`)
-    return EMPTY_CHECKLIST
+    return { list: EMPTY_CHECKLIST, lastPrompt: '' }
   }
 }
 
@@ -575,11 +580,20 @@ async function pruneBoard($: EngineInterface): Promise<string> {
   const stale = merged.filter(
     session => session.sessionId !== sessionId && (session.endedAt !== undefined || isStale(session, now)),
   )
-  if (stale.length === 0) return 'cc-board: nothing to prune.'
-  const answer = await $.ui
-    .ask(`Remove ${stale.length} stale or ended session(s) from the board?`, ['Remove', 'Keep'])
-    .catch(() => 'Keep')
-  if (answer !== 'Remove') return 'cc-board: kept everything.'
+  if (stale.length === 0 && !isRemoteConfigured()) return 'cc-board: nothing to prune.'
+  // With a shared board, rows older than the stale line may sit behind the read's cap, unseen.
+  const question =
+    stale.length > 0
+      ? `Remove ${stale.length} stale or ended session(s) from the board?`
+      : 'Nothing stale is listed. Sweep the shared board for rows older than 24 hours anyway?'
+  const answer = await $.ui.ask(question, [stale.length > 0 ? 'Remove' : 'Sweep', 'Keep']).catch(() => 'Keep')
+  if (answer === 'Keep') return 'cc-board: kept everything.'
+  const before = new Date(now - STALE_AFTER_MS).toISOString()
+  if (stale.length === 0) {
+    const swept = await deleteRemote($, [], before)
+    await refreshBoard($)
+    return swept ? 'cc-board: swept the shared board of rows older than 24 hours.' : 'cc-board: the sweep failed, see the debug log.'
+  }
 
   const localPaths = stale
     .map(session => `${session.sessionId}.json`)
@@ -590,7 +604,7 @@ async function pruneBoard($: EngineInterface): Promise<string> {
     if (removed.exitCode !== 0) return `cc-board: rm failed: ${removed.stderr}`
   }
   const remoteIds = stale.map(session => session.sessionId).filter(id => remoteSessions.has(id))
-  const remoteOk = await deleteRemote($, remoteIds, new Date(now - STALE_AFTER_MS).toISOString())
+  const remoteOk = await deleteRemote($, remoteIds, before)
   await refreshBoard($)
   const where = isRemoteConfigured() ? ` (${remoteIds.length} from the shared board${remoteOk ? '' : ', which failed'})` : ''
   return `cc-board: removed ${stale.length} session(s)${where}.`

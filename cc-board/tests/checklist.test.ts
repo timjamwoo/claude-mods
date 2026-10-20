@@ -5,6 +5,7 @@ import {
   addFollowUp,
   addManual,
   applyTaskEvent,
+  cueExcerpts,
   describeChanges,
   hasLooseEndCue,
   mergeTodos,
@@ -203,6 +204,17 @@ describe('loose ends', () => {
     expect(hasLooseEndCue('oh and remind me to bump the version')).toBe(true)
     expect(hasLooseEndCue('Make sure the signing cert is renewed before you ship.')).toBe(true)
     expect(hasLooseEndCue('Fixed the null reference in LoginPage and added a test.')).toBe(false)
+  })
+
+  test('cueExcerpts keeps every cue of a long exchange, with context', async () => {
+    const filler = 'The parser now handles nested groups correctly. '.repeat(200)
+    const text = `${filler}You'll need to rotate the key later.\n${filler}Also remember to bump the version.`
+    expect(text.length > 6000).toBe(true)
+    const excerpt = cueExcerpts(text)
+    expect(excerpt.length <= 6000).toBe(true)
+    expect(excerpt).toContain('rotate the key later')
+    expect(excerpt).toContain('bump the version')
+    expect(cueExcerpts('short text, later')).toBe('short text, later')
   })
 
   test('parseFollowUpLines strips bullets, drops NONE and repeats, and caps the list', async () => {

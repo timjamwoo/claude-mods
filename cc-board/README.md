@@ -184,9 +184,12 @@ surfaces, and both restore paths at startup.
 ## What it does not do
 
 It never answers or changes a tool call, and the only text it adds to a
-request is the checklist note. Its only network calls are the optional Haiku
-summary, through your own Claude Code credentials, and the table reads and
-writes once you configure a shared board. A missing board folder or a malformed board file is logged to
+request is the checklist note. It makes three kinds of network call, each
+with its own switch: the Haiku summary (`haikuSummary`), the Haiku
+loose-end scan of an exchange that carries a cue phrase (`followUps`), both
+through your own Claude Code credentials, and the table reads and writes
+once a shared board is configured (`boardUrl`). With all three off it
+touches nothing outside the machine. A missing board folder or a malformed board file is logged to
 the debug log (`claude --debug`) and skipped.
 
 There is no way for a mod to set the terminal tab title, and Claude Code
