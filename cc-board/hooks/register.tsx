@@ -68,6 +68,8 @@ const board = atom({ plugin: 'cc-board', key: 'board' } as const, [])
 
 let useHaiku = true
 let useFollowUps = true
+// Whether the sessions are also drawn in the band above the prompt.
+let showBand = false
 let pluginOptions: PluginOptions = {}
 
 let sessionId = ''
@@ -750,9 +752,17 @@ function itemLabel(item: ChecklistItem): string {
 
 // ---- Hooks ----------------------------------------------------------------
 
+/** The sessions the pane and the band list: every one not ended, this one first. */
+async function liveSessions($: EngineInterface): Promise<{ rows: BoardSession[]; now: number }> {
+  const all = await read($, board)
+  const now = await $.clock.now()
+  return { rows: sortSessions(all, sessionId).filter(session => session.endedAt === undefined), now }
+}
+
 export const register: Register = (on, options) => {
   useHaiku = options.haikuSummary !== false
   useFollowUps = options.followUps !== false
+  showBand = options.band === true
   pluginOptions = options
 
   on('session.start', async ($, e, next) => {
@@ -951,9 +961,20 @@ export const register: Register = (on, options) => {
     const list = await read($, checklist)
     const current = await read($, summary)
     const open = openItems(list.items).length
+    const { rows, now } = await liveSessions($)
 
     return (
       <Box flexDirection="column">
+        {rows.map(session => (
+          <Button
+            key={`session-${session.sessionId}`}
+            plain
+            dimColor={isStale(session, now)}
+            label={boardLine(session, session.sessionId === sessionId, now, machine)}
+            onPress={press => void switchToSession($, session, press.surface)}
+          />
+        ))}
+        {rows.length > 0 && <Text> </Text>}
         <Text bold>
           {project} · {open} open
         </Text>
@@ -977,11 +998,10 @@ export const register: Register = (on, options) => {
     )
   })
 
+  // The band is off unless asked for: the pane lists the sessions, and the band takes rows from every prompt.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey) return next(e)
-    const all = await read($, board)
-    const now = await $.clock.now()
-    const rows = sortSessions(all, sessionId).filter(session => session.endedAt === undefined)
+    if (!showBand || e.props.hasSurvey) return next(e)
+    const { rows, now } = await liveSessions($)
     if (rows.length === 0) return next(e)
 
     const { Box, Button } = $.ui.resolve(e)

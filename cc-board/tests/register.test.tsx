@@ -238,7 +238,7 @@ test('a MANUAL: line in Claude’s reply and /manual both add manual steps', asy
   expect(world.lastNote()).toContain('#2 "Rotate the key in the portal"')
 })
 
-test('the band lists every live session, marks this one and dims stale ones', async ($, on) => {
+test('the pane lists every live session, marks this one and dims stale ones; the band only when asked', async ($, on) => {
   const world = fakeWorld(on)
   await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
 
@@ -258,7 +258,7 @@ test('the band lists every live session, marks this one and dims stale ones', as
   await world.clock.advance(2000)
 
   for (const surface of ['terminal', 'desktop'] as const) {
-    const ui = await $.ui.mount({ ...BAND, surface })
+    const ui = await $.ui.mount({ ...PANE, surface })
     const mine = await ui.find({ type: 'Button', text: /my-app/ })
     expect(mine?.text).toBe('▶ my-app · — · 0 open')
     expect(mine?.key).toBe('session-sess-A')
@@ -269,6 +269,27 @@ test('the band lists every live session, marks this one and dims stale ones', as
     expect(stale?.text).toContain('stale')
     await ui.unmount()
   }
+
+  // The band above the prompt is passed on to the engine unless the band option is on. Nothing stands for
+  // the engine's own band in a test, so the pass-through surfaces as a mount with no drawing at all.
+  let outcome = ''
+  try {
+    await $.ui.mount({ ...BAND, surface: 'desktop' })
+  } catch (error) {
+    outcome = String(error)
+  }
+  expect(outcome).toContain('no implementation for ui.render')
+})
+
+test('with the band option on, the sessions are drawn above the prompt as well', { options: { band: true } }, async ($, on) => {
+  const world = fakeWorld(on)
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  world.put(`${BOARD_DIR}/sess-B.json`, JSON.stringify({ sessionId: 'sess-B', project: 'other-repo', cwd: '/work/other-repo', summary: '', items: [], updatedAt: '2026-10-20T11:55:00Z' }))
+  await world.clock.advance(2000)
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await band.find({ type: 'Button', text: /my-app/ }))?.key).toBe('session-sess-A')
+  expect((await band.find({ type: 'Button', text: /other-repo/ }))?.key).toBe('session-sess-B')
+  await band.unmount()
 })
 
 test('a restarted or resumed session takes its checklist back from its own board file', async ($, on) => {
@@ -418,7 +439,7 @@ test('with a shared board configured, this session’s row is upserted after a s
   expect(JSON.stringify(remote.table.get('sess-A'))).toBe(JSON.stringify(JSON.parse(world.files.get(`${BOARD_DIR}/sess-A.json`)?.text ?? '')))
 })
 
-test('sessions from the shared board join the band, and prune deletes from both stores', { ...OPTIONS }, async ($, on) => {
+test('sessions from the shared board join the pane, and prune deletes from both stores', { ...OPTIONS }, async ($, on) => {
   const world = fakeWorld(on)
   const cloud = {
     sessionId: 'sess-cloud',
@@ -438,7 +459,7 @@ test('sessions from the shared board join the band, and prune deletes from both 
   await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
   await world.clock.advance(15000)
 
-  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await ui.find({ type: 'Button', text: /other-repo/ }))?.text).toBe('  other-repo · Adding the settings page · 1 open · @cloud')
   expect((await ui.find({ type: 'Button', text: /old-repo/ }))?.props.dimColor).toBe(true)
   await ui.unmount()
@@ -614,7 +635,7 @@ test('a click on a board line raises that session’s terminal, opens its page, 
   expect(world.boardFile('sess-A')?.tty).toBe('/dev/ttys003')
   await world.clock.advance(2000)
 
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'session-sess-B' })
   expect(world.scripts.length).toBe(1)
   expect(world.scripts[0]).toContain('"/dev/ttys007"')
@@ -645,7 +666,7 @@ test('a cloud session records its claude.ai page, and a click from the cloud fal
   expect(mine?.url).toBe('https://claude.ai/code/session_01A')
   await world.clock.advance(2000)
 
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'session-sess-D' })
   expect(world.opened).toEqual([])
   expect(world.copied).toEqual(['cd /home/user/cloud-repo && claude --resume sess-D'])
