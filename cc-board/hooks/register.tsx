@@ -353,8 +353,8 @@ async function askHaiku($: EngineInterface): Promise<string> {
     const reply = await $.model.complete({
       model: 'haiku',
       system:
-        'You summarize what a coding session is working on. Answer with one plain sentence of at most twelve words, no quotes, no preamble.',
-      prompt: `User's latest request:\n${clip(lastPrompt, 1500)}\n\nAssistant's latest reply:\n${clip(lastAnswer, 1500)}`,
+        'You write a one-line status for a board of coding sessions. Answer with one plain phrase of at most twelve words that says what the session is working on, starting with a verb ending in -ing, such as "Fixing the login crash on iOS". No quotes, no preamble, no mention of the user or the assistant. The excerpts may be cut short; never remark on that.',
+      prompt: `Latest request:\n${clip(lastPrompt, 1500)}\n\nEnd of the latest reply:\n${tail(lastAnswer, 1500)}`,
       maxTokens: 60,
       effort: 'low',
       timeoutMs: 8000,
@@ -520,6 +520,12 @@ async function pruneBoard($: EngineInterface): Promise<string> {
   return `cc-board: removed ${stale.length} session(s)${where}.`
 }
 
+/** The last `max` characters of a text on one line, with a leading ellipsis when cut. */
+function tail(text: string, max: number): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim()
+  return oneLine.length <= max ? oneLine : `…${oneLine.slice(oneLine.length - max + 1)}`
+}
+
 function itemMark(item: ChecklistItem): string {
   if (item.status === 'completed') return '[x]'
   if (item.status === 'in_progress') return '[>]'
@@ -645,10 +651,20 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // Only what a person typed feeds the summary: notifications, scheduled
+  // triggers and other sessions' messages are not what this session works on.
+  on('prompt.submit', async ($, e, next) => {
+    const kind = e.origin.kind
+    const isTyped = e.isMeta !== true && e.command === undefined && (kind === 'composer' || kind === 'bridge' || kind === 'sdk')
+    if (isTyped) {
+      const typed = cleanPrompt(e.text)
+      if (typed !== '') lastPrompt = typed
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('turn.start', async ($, e, next) => {
-    const typed = e.agentId === undefined ? cleanPrompt(e.text) : ''
-    if (typed !== '') {
-      lastPrompt = typed
+    if (e.agentId === undefined) {
       await refreshSummary($, false)
       await writeBoardFile($)
     }

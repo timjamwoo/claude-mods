@@ -422,9 +422,12 @@ test('a Haiku summary stays until the next one, and the raw prompt is only a fir
   })
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
   await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
 
-  await $.turn.start({ text: '<task-notification>\n<status>x</status>\n</task-notification>\nthe login page crashes on launch', turnId: 't1' })
+  const typed = (text: string) => $.prompt.submit({ text, origin: { kind: 'composer' }, wait: false })
+  await typed('<task-notification>\n<status>x</status>\n</task-notification>\nthe login page crashes on launch')
+  await $.turn.start({ text: 'the login page crashes on launch', turnId: 't1' })
   expect(world.boardFile('sess-A')?.summary).toBe('the login page crashes on launch')
   await $.turn.complete({ turnId: 't1', answer: 'On it.', durationMs: 10, isAborted: false, reason: 'answer' })
   expect(world.boardFile('sess-A')?.summary).toBe('Fixing the login crash')
@@ -432,6 +435,7 @@ test('a Haiku summary stays until the next one, and the raw prompt is only a fir
 
   // A new prompt within the five-minute gap keeps the Haiku sentence instead of the raw prompt.
   await world.clock.advance(60_000)
+  await typed('ok and what about the claude prompt update?')
   await $.turn.start({ text: 'ok and what about the claude prompt update?', turnId: 't2' })
   await $.turn.complete({ turnId: 't2', answer: 'Done.', durationMs: 10, isAborted: false, reason: 'answer' })
   expect(world.boardFile('sess-A')?.summary).toBe('Fixing the login crash')
@@ -439,7 +443,16 @@ test('a Haiku summary stays until the next one, and the raw prompt is only a fir
 
   // Past the gap, the next completed turn asks again.
   await world.clock.advance(5 * 60_000)
+  await typed('now the settings page')
   await $.turn.start({ text: 'now the settings page', turnId: 't3' })
   await $.turn.complete({ turnId: 't3', answer: 'Done.', durationMs: 10, isAborted: false, reason: 'answer' })
   expect(asked).toBe(2)
+
+  // A background notification is not a request: it neither becomes the summary nor calls Haiku.
+  await world.clock.advance(5 * 60_000)
+  await $.prompt.submit({ text: 'Task finished: build 42', origin: { kind: 'task-notification' }, wait: false })
+  await $.turn.start({ text: 'Task finished: build 42', turnId: 't4' })
+  await $.turn.complete({ turnId: 't4', answer: 'Noted.', durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(asked).toBe(2)
+  expect(world.boardFile('sess-A')?.summary).toBe('Fixing the login crash')
 })
