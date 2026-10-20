@@ -33,9 +33,11 @@ note says so, so Claude stops reminding you and does not add it back.
 **A live board of all sessions.** Each session writes
 `~/.claude/board/<session-id>.json` (atomically, temp file plus rename).
 Every session polls that folder every two seconds and draws one line per
-live session in the band above the prompt: project, a one-sentence summary,
-open item count. The current session is marked with `▶`. Sessions with no
-update for 24 hours are dimmed as stale. Nothing here needs a Claude turn.
+live session at the top of the pane: project, a one-sentence summary, open
+item count. The current session is marked with `▶`. Sessions with no update
+for 24 hours are dimmed as stale. Nothing here needs a Claude turn. The
+`band` option draws the same lines above the prompt as well, for a terminal
+too narrow to place the pane; it is off by default.
 
 **Restarts, resumes and older sessions.** A session keeps its id across a
 restart or `claude --resume`, so at startup the mod reads its own board
@@ -44,7 +46,7 @@ the mod reads the transcript instead and seeds the checklist from the last
 TodoWrite call and any `MANUAL:` lines Claude wrote. Neither sends Claude a
 note, since Claude already knows all of it.
 
-**Click a session to switch to it.** Each band line is a button. A session
+**Click a session to switch to it.** Each session line is a button. A session
 records the terminal it runs in, and a click asks Terminal.app, then
 iTerm2, to bring that tab to the front. macOS asks once to let your
 terminal control them. A cloud session records its claude.ai/code page,
@@ -117,7 +119,7 @@ script clones this repository into the container. Anyone who can use that
 environment can read its variables, so keep the project to this one table.
 
 Each session is tagged with where it runs, `cloud` or the Mac's host name,
-and the band shows the tag for sessions on other machines. `/board prune`
+and the pane shows the tag for sessions on other machines. `/board prune`
 removes stale sessions from the table as well as the local folder. If the
 table cannot be reached, the mod shows one toast, logs the reason, and
 carries on with the local board.
@@ -144,7 +146,7 @@ block of `~/.claude/settings.json`:
 ```
 
 Open two sessions in two repos. Each one gets its own checklist and both
-bands list both sessions within a couple of seconds.
+panes list both sessions within a couple of seconds.
 
 ## Install from the marketplace
 
@@ -182,8 +184,8 @@ claude plugin test cc-board
 `validate` lists every event the mod hooks and every call it makes. `test`
 runs the files under `tests/`: the board file round trip and malformed
 files, `MANUAL:` parsing, keeping ticked items done through a TodoWrite
-update, the note sent to Claude, the band on the terminal and desktop
-surfaces, and both restore paths at startup.
+update, the note sent to Claude, the pane and the band on the terminal and
+desktop surfaces, and both restore paths at startup.
 
 ## Files
 
@@ -191,7 +193,7 @@ surfaces, and both restore paths at startup.
   the band, the poll, the board file writes.
 - `hooks/checklist.ts` is the checklist logic, pure functions only.
 - `hooks/board.ts` is the board file shape, the stale rule, the merge of
-  local and shared sessions, and the text the band and `/board` print.
+  local and shared sessions, and the text the pane and `/board` print.
 - `hooks/shared.ts` builds the table requests and reads the rows back.
 - `types/index.d.ts` declares the values kept in `$.state`.
 - `tests/` holds the tests `claude plugin test` runs.

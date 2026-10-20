@@ -18,6 +18,12 @@
       "description": "After a turn that mentions something to do later, by hand, or not yet, ask Haiku to list those loose ends and add them to the checklist.",
       "default": true
     },
+    "band": {
+      "type": "boolean",
+      "title": "Sessions above the prompt",
+      "description": "Also list the sessions in the band above the prompt, for a terminal too narrow for the pane. The pane lists them either way.",
+      "default": false
+    },
     "boardUrl": {
       "type": "string",
       "title": "Shared board URL",
