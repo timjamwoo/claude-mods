@@ -70,8 +70,23 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
       }
     }
     if (command === 'rm') for (const path of args.slice(1)) files.delete(path)
-    const stdout = command === 'hostname' ? 'mbp\n' : ''
+    let stdout = ''
+    if (command === 'hostname') stdout = 'mbp\n'
+    if (command === 'sh' && (args[1] ?? '').includes('ps -o tty=')) stdout = 'ttys003\n'
+    if (command === 'osascript') {
+      const script = args[1] ?? ''
+      scripts.push(script)
+      stdout = [...terminalTtys].some(one => script.includes(`"${one}"`)) ? 'ok\n' : 'none\n'
+    }
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  // Terminal tabs the fake AppleScript can find, by tty, and the scripts it was handed.
+  const terminalTtys = new Set<string>()
+  const scripts: string[] = []
+  const copied: string[] = []
+  on('ui.copy', (_, e) => {
+    copied.push(e.text)
+    return { value: { isCopied: true } }
   })
   const toasts: string[] = []
   on('ui.toast', (_, e) => {
@@ -116,7 +131,7 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
   }
   const noteCount = () => session.appended().filter(one => one.door === 'note').length
 
-  return { files, clock, session, boardFile, put, lastNote, noteCount, toasts }
+  return { files, clock, session, boardFile, put, lastNote, noteCount, toasts, terminalTtys, scripts, copied }
 }
 
 const TODOS = [
@@ -236,12 +251,12 @@ test('the band lists every live session, marks this one and dims stale ones', as
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
-    const mine = await ui.find({ type: 'Text', text: /my-app/ })
+    const mine = await ui.find({ type: 'Button', text: /my-app/ })
     expect(mine?.text).toBe('▶ my-app · — · 0 open')
-    expect(mine?.props.bold).toBe(true)
-    const theirs = await ui.find({ type: 'Text', text: /other-repo/ })
+    expect(mine?.key).toBe('session-sess-A')
+    const theirs = await ui.find({ type: 'Button', text: /other-repo/ })
     expect(theirs?.text).toBe('  other-repo · Adding the settings page · 1 open')
-    const stale = await ui.find({ type: 'Text', text: /old-repo/ })
+    const stale = await ui.find({ type: 'Button', text: /old-repo/ })
     expect(stale?.props.dimColor).toBe(true)
     expect(stale?.text).toContain('stale')
     await ui.unmount()
@@ -416,8 +431,8 @@ test('sessions from the shared board join the band, and prune deletes from both 
   await world.clock.advance(15000)
 
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  expect((await ui.find({ type: 'Text', text: /other-repo/ }))?.text).toBe('  other-repo · Adding the settings page · 1 open · @cloud')
-  expect((await ui.find({ type: 'Text', text: /old-repo/ }))?.props.dimColor).toBe(true)
+  expect((await ui.find({ type: 'Button', text: /other-repo/ }))?.text).toBe('  other-repo · Adding the settings page · 1 open · @cloud')
+  expect((await ui.find({ type: 'Button', text: /old-repo/ }))?.props.dimColor).toBe(true)
   await ui.unmount()
 
   // The capped read holds 500 rows, so some stale rows were never seen; prune still removes them by time.
@@ -578,4 +593,54 @@ test('/board prune sweeps rows hidden behind the read cap even when nothing stal
   expect(result?.text).toContain('swept')
   expect([...remote.table.keys()].some(id => id.startsWith('sess-ancient'))).toBe(false)
   expect(remote.table.size).toBe(501)
+})
+
+test('a click on a board line raises that session’s terminal, or copies how to resume it', async ($, on) => {
+  const world = fakeWorld(on)
+  world.terminalTtys.add('/dev/ttys007')
+  const base = { project: 'other-repo', cwd: '/work/other-repo', summary: 'Adding the settings page', items: [], updatedAt: '2026-10-20T11:59:00Z' }
+  world.put(`${BOARD_DIR}/sess-B.json`, JSON.stringify({ ...base, sessionId: 'sess-B', machine: 'mbp', tty: '/dev/ttys007' }))
+  world.put(`${BOARD_DIR}/sess-C.json`, JSON.stringify({ ...base, sessionId: 'sess-C', project: 'cloud-repo', cwd: '/home/user/cloud-repo', machine: 'cloud' }))
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  expect(world.boardFile('sess-A')?.tty).toBe('/dev/ttys003')
+  await world.clock.advance(2000)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'session-sess-B' })
+  expect(world.scripts.length).toBe(1)
+  expect(world.scripts[0]).toContain('"/dev/ttys007"')
+  expect(world.copied).toEqual([])
+
+  await ui.press({ key: 'session-sess-C' })
+  expect(world.scripts.length).toBe(1)
+  expect(world.copied).toEqual(['cd /home/user/cloud-repo && claude --resume sess-C'])
+  expect(world.toasts.at(-1)).toContain('it runs on cloud')
+
+  await ui.press({ key: 'session-sess-A' })
+  expect(world.toasts.at(-1)).toBe('that is this session')
+  await ui.unmount()
+})
+
+test('a long-running chat is scanned for loose ends from its whole history, and /board scan repeats it', async ($, on) => {
+  const transcript: SessionMessage[] = []
+  for (let i = 0; i < 40; i += 1) {
+    transcript.push({ role: 'user', text: `question ${i}`, toolUses: [] })
+    transcript.push({ role: 'assistant', text: i === 2 ? 'Done. You will need to renew the push certificate later.' : `answer ${i}`, toolUses: [] })
+  }
+  const world = fakeWorld(on, transcript)
+  const scans: string[] = []
+  on('model.complete', (_, e) => {
+    if (e.prompt.startsWith('Already on the checklist')) scans.push(e.prompt)
+    const text = e.prompt.includes('push certificate') ? 'Renew the push certificate' : e.prompt.startsWith('Already') ? 'NONE' : 'Answering questions'
+    return { value: { isAnswered: true, text, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
+  })
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+
+  // Only the one chunk with a cue phrase cost a model call, and it reached back 76 messages.
+  expect(scans.length).toBe(1)
+  expect(world.boardFile('sess-A')?.items.map(item => [item.text, item.source])).toEqual([['Renew the push certificate', 'followup']])
+
+  const again = await $.command.run({ command: 'board', args: 'scan', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(again?.text).toBe('cc-board: no new loose ends in this chat.')
+  expect(world.boardFile('sess-A')?.items.length).toBe(1)
 })

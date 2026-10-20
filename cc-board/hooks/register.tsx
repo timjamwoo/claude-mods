@@ -11,7 +11,7 @@
 // Every helper that takes `$` is a top-level function: `claude plugin validate`
 // follows `$` only into those.
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, Register, Timer } from 'claude-code'
+import type { EngineInterface, PluginOptions, Register, RenderSurface, Timer } from 'claude-code'
 
 import type { BoardSession, Checklist, ChecklistItem } from '../types'
 import {
@@ -74,6 +74,7 @@ let sessionId = ''
 let cwd = ''
 let project = ''
 let machine = ''
+let tty = ''
 let boardDir = ''
 
 // The shared table, when configured.
@@ -127,6 +128,7 @@ async function writeBoardFile($: EngineInterface, endedAt?: string): Promise<voi
     }
     if (endedAt !== undefined) snapshot.endedAt = endedAt
     if (machine !== '') snapshot.machine = machine
+    if (tty !== '') snapshot.tty = tty
 
     // $.fs.write is not atomic, so write a temp file and rename it into place.
     const target = fileFor(boardDir, sessionId)
@@ -203,6 +205,77 @@ async function configureRemote($: EngineInterface): Promise<void> {
   boardUrl = option('boardUrl') || ((await $.env.get('CC_BOARD_URL')) ?? '').trim()
   boardKey = option('boardKey') || ((await $.env.get('CC_BOARD_KEY')) ?? '').trim()
   if (boardUrl !== '' && boardKey === '') log($, 'boardUrl is set but no key: the board stays local')
+}
+
+/** The terminal this session runs in, as /dev/ttysNNN, or '' when it has none (the desktop app, a cloud session). */
+async function detectTty($: EngineInterface): Promise<string> {
+  try {
+    const found = await $.process.run(['sh', '-c', 'ps -o tty= -p $PPID'], { timeoutMs: 3000 })
+    const name = found.stdout.trim()
+    if (found.exitCode !== 0 || name === '' || name === '?' || name === '??') return ''
+    return name.startsWith('/dev/') ? name : `/dev/${name}`
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Brings the terminal tab of a session on this machine to the front, through
+ * Terminal.app then iTerm2. Resolves false when neither holds that tty.
+ */
+async function raiseTerminal($: EngineInterface, target: string): Promise<boolean> {
+  const scripts = [
+    `tell application "Terminal"
+      repeat with w in windows
+        repeat with t in tabs of w
+          if tty of t is "${target}" then
+            set selected tab of w to t
+            set index of w to 1
+            activate
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end tell
+    return "none"`,
+    `tell application "iTerm2"
+      repeat with w in windows
+        repeat with t in tabs of w
+          repeat with s in sessions of t
+            if tty of s is "${target}" then
+              select t
+              select s
+              activate
+              return "ok"
+            end if
+          end repeat
+        end repeat
+      end repeat
+    end tell
+    return "none"`,
+  ]
+  for (const script of scripts) {
+    try {
+      const ran = await $.process.run(['osascript', '-e', script], { timeoutMs: 8000 })
+      if (ran.exitCode === 0 && ran.stdout.trim() === 'ok') return true
+    } catch (error) {
+      log($, `osascript failed: ${String(error)}`)
+    }
+  }
+  return false
+}
+
+/** What a click on a board line does: raise that session's terminal, or copy how to get back to it. */
+async function switchToSession($: EngineInterface, target: BoardSession, surface: RenderSurface): Promise<void> {
+  if (target.sessionId === sessionId) {
+    $.ui.toast('that is this session')
+    return
+  }
+  if (target.tty !== undefined && target.machine === machine && (await raiseTerminal($, target.tty))) return
+  const command = `cd ${target.cwd} && claude --resume ${target.sessionId}`
+  const copied = await $.ui.copy({ text: command, surface }).catch(() => ({ isCopied: false as const, reason: 'failed' }))
+  const where = target.machine !== undefined && target.machine !== machine ? ` (it runs on ${target.machine})` : ''
+  $.ui.toast(copied.isCopied ? `resume command copied${where}` : `resume with: ${command}`)
 }
 
 /** A short label for where this session runs: "cloud", or the host name. */
@@ -460,6 +533,29 @@ async function extractFollowUps($: EngineInterface, text: string): Promise<strin
   }
 }
 
+const SCAN_CHUNK_MESSAGES = 16
+const SCAN_MAX_CALLS = 8
+
+/**
+ * Reads a whole conversation for loose ends, newest first, in chunks of
+ * messages, with at most SCAN_MAX_CALLS model calls. Chunks with no cue
+ * phrase cost nothing. Resolves how many loose ends were new.
+ */
+async function scanTranscript($: EngineInterface, messages: readonly { role: 'user' | 'assistant'; text: string }[]): Promise<number> {
+  if (!useFollowUps) return 0
+  let found = 0
+  let calls = 0
+  for (let end = messages.length; end > 0 && calls < SCAN_MAX_CALLS; end -= SCAN_CHUNK_MESSAGES) {
+    const chunk = messages.slice(Math.max(0, end - SCAN_CHUNK_MESSAGES), end)
+    const text = chunk.map(message => `${message.role === 'user' ? 'User' : 'Claude'}: ${cleanPrompt(message.text)}`).join('\n\n')
+    if (!hasLooseEndCue(text)) continue
+    calls += 1
+    found += await surfaceFollowUps($, text)
+  }
+  if (found > 0) await writeBoardFile($)
+  return found
+}
+
 /** Adds the loose ends found in `text` to the checklist and tells Claude. Resolves how many were new. */
 async function surfaceFollowUps($: EngineInterface, text: string): Promise<number> {
   if (!useFollowUps || !hasLooseEndCue(text)) return 0
@@ -529,9 +625,8 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
     if (list.items.length === 0 && lastPrompt === '') return 'none'
     await update($, checklist, () => list)
     await refreshSummary($, false)
-    // One scan of the recent conversation for loose ends mentioned before the mod loaded.
-    const recent = messages.slice(-30).map(message => `${message.role === 'user' ? 'User' : 'Claude'}: ${cleanPrompt(message.text)}`).join('\n\n')
-    await surfaceFollowUps($, recent)
+    // Loose ends mentioned before the mod loaded, anywhere in the conversation.
+    await scanTranscript($, messages)
     return 'transcript'
   } catch (error) {
     log($, `seed from transcript failed: ${String(error)}`)
@@ -567,8 +662,8 @@ async function registerCommands($: EngineInterface): Promise<void> {
   })
   await $.command.register({
     name: 'board',
-    description: 'Print the board of all sessions; “prune” removes stale ones',
-    argumentHint: '[prune]',
+    description: 'Print the board of all sessions; “prune” removes stale ones, “scan” reads this chat for loose ends',
+    argumentHint: '[prune|scan]',
     immediate: true,
   })
 }
@@ -641,6 +736,7 @@ export const register: Register = (on, options) => {
       boardDir = home === undefined || home === '' ? '' : `${home}/.claude/board`
       if (boardDir === '') log($, 'HOME is unset, so no board file is written')
       machine = await detectMachine($)
+      tty = await detectTty($)
       await configureRemote($)
     } catch (error) {
       log($, `start failed: ${String(error)}`)
@@ -802,6 +898,18 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'board' }, async ($, e) => {
     await refreshBoard($)
     if (e.args.trim() === 'prune') return { text: await pruneBoard($) }
+    if (e.args.trim() === 'scan') {
+      if (!useFollowUps) return { text: 'cc-board: loose-end scans are off (followUps).' }
+      try {
+        const messages = await $.session.messages()
+        if ('deny' in messages) return { text: 'cc-board: the transcript could not be read.' }
+        const found = await scanTranscript($, messages)
+        void $.ui.open({ id: PANE, title: 'cc-board' })
+        return { text: found === 0 ? 'cc-board: no new loose ends in this chat.' : `cc-board: ${found} loose end(s) added from this chat.` }
+      } catch (error) {
+        return { text: `cc-board: scan failed: ${String(error)}` }
+      }
+    }
     void $.ui.open({ id: PANE, title: 'cc-board' })
     const now = await $.clock.now()
     const merged = mergeSessions([...sessions.values()], [...remoteSessions.values()])
@@ -848,13 +956,17 @@ export const register: Register = (on, options) => {
     const rows = sortSessions(all, sessionId).filter(session => session.endedAt === undefined)
     if (rows.length === 0) return next(e)
 
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Button } = $.ui.resolve(e)
     return (
       <Box flexDirection="column">
         {rows.map(session => (
-          <Text bold={session.sessionId === sessionId} dimColor={isStale(session, now)} wrap="truncate-end">
-            {boardLine(session, session.sessionId === sessionId, now, machine)}
-          </Text>
+          <Button
+            key={`session-${session.sessionId}`}
+            plain
+            dimColor={isStale(session, now)}
+            label={boardLine(session, session.sessionId === sessionId, now, machine)}
+            onPress={press => void switchToSession($, session, press.surface)}
+          />
         ))}
       </Box>
     )

@@ -41,6 +41,8 @@ export type BoardSession = {
   endedAt?: string
   /** Where the session runs: a short host name, or "cloud". */
   machine?: string
+  /** The terminal the session runs in, such as /dev/ttys003, when it has one. */
+  tty?: string
 }
 
 declare module 'claude-code' {

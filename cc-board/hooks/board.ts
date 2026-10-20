@@ -57,7 +57,7 @@ export function parse(text: string): BoardSession | undefined {
 /** As `parse`, for a value already decoded from JSON. */
 export function parseValue(raw: unknown): BoardSession | undefined {
   if (!isRecord(raw)) return undefined
-  const { sessionId, project, cwd, summary, items, updatedAt, endedAt, machine } = raw
+  const { sessionId, project, cwd, summary, items, updatedAt, endedAt, machine, tty } = raw
   if (typeof sessionId !== 'string' || sessionId === '') return undefined
   if (typeof project !== 'string' || typeof cwd !== 'string') return undefined
   if (typeof updatedAt !== 'string' || Number.isNaN(Date.parse(updatedAt))) return undefined
@@ -72,6 +72,7 @@ export function parseValue(raw: unknown): BoardSession | undefined {
   }
   if (typeof endedAt === 'string') session.endedAt = endedAt
   if (typeof machine === 'string' && machine !== '') session.machine = machine
+  if (typeof tty === 'string' && tty.startsWith('/dev/')) session.tty = tty
   return session
 }
 
