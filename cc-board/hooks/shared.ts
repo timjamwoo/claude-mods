@@ -9,9 +9,17 @@ export function tableUrl(projectUrl: string): string {
   return `${projectUrl.replace(/\/+$/, '')}/rest/v1/${TABLE}`
 }
 
-/** The query that reads every row's document. */
+/** How many sessions one read brings back, newest first. Older rows are stale by then and prune removes them by time. */
+export const READ_LIMIT = 500
+
+/** The query that reads the newest rows' documents. */
 export function readUrl(projectUrl: string): string {
-  return `${tableUrl(projectUrl)}?select=payload`
+  return `${tableUrl(projectUrl)}?select=payload&order=updated_at.desc&limit=${READ_LIMIT}`
+}
+
+/** The query that deletes every row last updated before `beforeIso`, whether a read returned it or not. */
+export function deleteBeforeUrl(projectUrl: string, beforeIso: string): string {
+  return `${tableUrl(projectUrl)}?updated_at=lt.${encodeURIComponent(beforeIso)}`
 }
 
 /** The query that deletes the named sessions' rows. */

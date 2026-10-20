@@ -345,7 +345,11 @@ function fakeTable(on: On, rows: Record<string, unknown>) {
       return { value: { status: 401, ok: false, headers: {}, text: '{"message":"Invalid API key"}' } }
     }
     if (method === 'GET') {
-      const text = JSON.stringify([...table.values()].map(payload => ({ payload })))
+      // Newest first, capped as PostgREST caps a read.
+      const limit = Number(/limit=(\d+)/.exec(e.url)?.[1] ?? 1000)
+      const rows = [...table.values()] as { updatedAt: string }[]
+      rows.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+      const text = JSON.stringify(rows.slice(0, limit).map(payload => ({ payload })))
       return { value: { status: 200, ok: true, headers: {}, text } }
     }
     if (method === 'POST') {
@@ -354,8 +358,15 @@ function fakeTable(on: On, rows: Record<string, unknown>) {
       return { value: { status: 201, ok: true, headers: {}, text: '' } }
     }
     if (method === 'DELETE') {
-      const match = /session_id=in\.\((.*)\)$/.exec(decodeURIComponent(e.url))
-      for (const id of (match?.[1] ?? '').split(',').map(one => one.replace(/"/g, ''))) table.delete(id)
+      const url = decodeURIComponent(e.url)
+      const byId = /session_id=in\.\((.*)\)$/.exec(url)
+      for (const id of (byId?.[1] ?? '').split(',').map(one => one.replace(/"/g, '')).filter(one => one !== '')) table.delete(id)
+      const before = /updated_at=lt\.(.*)$/.exec(url)?.[1]
+      if (before !== undefined) {
+        for (const [id, payload] of [...table.entries()] as [string, { updatedAt: string }][]) {
+          if (Date.parse(payload.updatedAt) < Date.parse(before)) table.delete(id)
+        }
+      }
       call.status = 204
       return { value: { status: 204, ok: true, headers: {}, text: '' } }
     }
@@ -396,7 +407,10 @@ test('sessions from the shared board join the band, and prune deletes from both 
     machine: 'cloud',
   }
   const old = { ...cloud, sessionId: 'sess-old', project: 'old-repo', updatedAt: '2026-10-10T11:55:00Z' }
-  const remote = fakeTable(on, { 'sess-cloud': cloud, 'sess-old': old })
+  // Enough forgotten sessions that a capped read never returns the oldest ones.
+  const forgotten: Record<string, unknown> = {}
+  for (let i = 0; i < 600; i += 1) forgotten[`sess-gone-${i}`] = { ...old, sessionId: `sess-gone-${i}`, updatedAt: `2026-09-${String(1 + (i % 28)).padStart(2, '0')}T00:00:00Z` }
+  const remote = fakeTable(on, { 'sess-cloud': cloud, 'sess-old': old, ...forgotten })
 
   await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
   await world.clock.advance(15000)
@@ -406,8 +420,10 @@ test('sessions from the shared board join the band, and prune deletes from both 
   expect((await ui.find({ type: 'Text', text: /old-repo/ }))?.props.dimColor).toBe(true)
   await ui.unmount()
 
+  // The capped read holds 500 rows, so some stale rows were never seen; prune still removes them by time.
+  expect(remote.table.size).toBe(603)
   const result = await $.command.run({ command: 'board', args: 'prune', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
-  expect(result?.text).toContain('removed 1 session(s) (1 from the shared board)')
+  expect(result?.text).toContain('from the shared board')
   expect([...remote.table.keys()].sort()).toEqual(['sess-A', 'sess-cloud'])
 })
 

@@ -44,8 +44,9 @@ import {
   parse,
   serialize,
   sortSessions,
+  STALE_AFTER_MS,
 } from './board'
-import { deleteUrl, parseRows, readUrl, sharedHeaders, tableUrl, upsertBody, upsertHeaders } from './shared'
+import { deleteBeforeUrl, deleteUrl, parseRows, readUrl, sharedHeaders, tableUrl, upsertBody, upsertHeaders } from './shared'
 
 const PANE = 'cc-board'
 const POLL_MS = 2000
@@ -263,14 +264,24 @@ async function pullRemote($: EngineInterface): Promise<void> {
   }
 }
 
-/** Deletes the named sessions' rows. Resolves false when the request failed. */
-async function deleteRemote($: EngineInterface, sessionIds: readonly string[]): Promise<boolean> {
-  if (!isRemoteConfigured() || sessionIds.length === 0) return true
+/**
+ * Deletes the named sessions' rows, and every row older than the stale line,
+ * which reaches rows a capped read never returned. False when a request failed.
+ */
+async function deleteRemote($: EngineInterface, sessionIds: readonly string[], beforeIso: string): Promise<boolean> {
+  if (!isRemoteConfigured()) return true
+  const urls = [deleteBeforeUrl(boardUrl, beforeIso)]
+  if (sessionIds.length > 0) urls.push(deleteUrl(boardUrl, sessionIds))
   try {
-    const response = await $.http.fetch(deleteUrl(boardUrl, sessionIds), { method: 'DELETE', headers: sharedHeaders(boardKey) })
-    if (!response.ok) remoteFailed($, 'prune', response.status)
-    else for (const id of sessionIds) remoteSessions.delete(id)
-    return response.ok
+    for (const url of urls) {
+      const response = await $.http.fetch(url, { method: 'DELETE', headers: sharedHeaders(boardKey) })
+      if (!response.ok) {
+        remoteFailed($, 'prune', response.status)
+        return false
+      }
+    }
+    for (const id of sessionIds) remoteSessions.delete(id)
+    return true
   } catch (error) {
     remoteFailed($, 'prune', String(error))
     return false
@@ -521,9 +532,9 @@ async function pruneBoard($: EngineInterface): Promise<string> {
     if (removed.exitCode !== 0) return `cc-board: rm failed: ${removed.stderr}`
   }
   const remoteIds = stale.map(session => session.sessionId).filter(id => remoteSessions.has(id))
-  const remoteOk = await deleteRemote($, remoteIds)
+  const remoteOk = await deleteRemote($, remoteIds, new Date(now - STALE_AFTER_MS).toISOString())
   await refreshBoard($)
-  const where = remoteIds.length > 0 ? ` (${remoteIds.length} from the shared board${remoteOk ? '' : ', which failed'})` : ''
+  const where = isRemoteConfigured() ? ` (${remoteIds.length} from the shared board${remoteOk ? '' : ', which failed'})` : ''
   return `cc-board: removed ${stale.length} session(s)${where}.`
 }
 
