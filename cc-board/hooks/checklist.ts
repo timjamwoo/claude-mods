@@ -149,7 +149,7 @@ export function cueExcerpts(text: string, max = 6000, radius = 600): string {
  * The loose ends a model listed, one per line: bullets and numbering
  * stripped, NONE and empty lines dropped, repeats and over-long lines removed.
  */
-export function parseFollowUpLines(reply: string, max = 5): string[] {
+export function parseFollowUpLines(reply: string, max = 3): string[] {
   const lines: string[] = []
   for (const raw of reply.split('\n')) {
     const line = raw.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').trim()

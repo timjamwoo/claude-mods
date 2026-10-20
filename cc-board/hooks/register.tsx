@@ -443,7 +443,7 @@ async function extractFollowUps($: EngineInterface, text: string): Promise<strin
     const reply = await $.model.complete({
       model: 'haiku',
       system:
-        'You keep a checklist for a developer so nothing said in passing is forgotten. Read the exchange and list only loose ends: things someone said should happen later, must be done by hand, were deferred or skipped for now, or were asked for and not done. Do not list work the reply says is finished, and do not list anything already on the checklist. One per line, imperative, at most twelve words, at most five lines, no numbering, no commentary. If there is nothing, reply NONE.',
+        'You keep a checklist for a developer so small things said in passing are not forgotten. Read the exchange and list only concrete actions a person still has to do: something to do by hand or outside this conversation (a portal, a key, a certificate, a store listing, a release, a config), something deferred or skipped for now, or something asked for and not done. Skip what the assistant says it will do next, skip advice and hypotheticals, skip anything finished, and skip anything already on the checklist. One per line, imperative, at most twelve words, at most three lines, no numbering, no commentary. If there is nothing, reply NONE.',
       prompt: `Already on the checklist:\n${open === '' ? '(nothing)' : open}\n\nExchange:\n${cueExcerpts(text)}`,
       maxTokens: 160,
       effort: 'low',

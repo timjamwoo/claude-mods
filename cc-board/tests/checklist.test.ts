@@ -224,7 +224,7 @@ describe('loose ends', () => {
       'Bump the version',
       'Submit the build',
     ])
-    expect(parseFollowUpLines('a\nb\nc\nd\ne\nf\ng').length).toBe(5)
+    expect(parseFollowUpLines('a\nb\nc\nd\ne\nf\ng').length).toBe(3)
   })
 
   test('addFollowUp dedupes against any item by normalized text', async () => {
