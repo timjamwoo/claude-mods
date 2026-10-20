@@ -140,3 +140,48 @@ export function describeChanges(changes: readonly Change[]): string {
   }
   return `[cc-board] Checklist update. ${parts.join(' ')}`
 }
+
+/** The part of a transcript message the seed needs; `$.session.messages()` rows fit it. */
+export type TranscriptMessage = {
+  role: 'user' | 'assistant'
+  text: string
+  toolUses: readonly { tool: string; input: Record<string, unknown>; agentId?: string }[]
+}
+
+function parseTodo(value: unknown): Todo | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const { content, status } = value as Record<string, unknown>
+  if (typeof content !== 'string') return undefined
+  if (status !== 'pending' && status !== 'in_progress' && status !== 'completed') return undefined
+  return { content, status }
+}
+
+/**
+ * What a session that predates the mod has already decided: the todos of the
+ * last TodoWrite on the main loop, and every MANUAL: line Claude wrote.
+ * `todos` is undefined when no TodoWrite call was found.
+ */
+export function seedFromTranscript(messages: readonly TranscriptMessage[]): { todos: Todo[] | undefined; manualLines: string[] } {
+  let todos: Todo[] | undefined
+  const manualLines: string[] = []
+
+  for (const message of messages) {
+    if (message.role !== 'assistant') continue
+    for (const use of message.toolUses) {
+      if (use.tool !== 'TodoWrite' || use.agentId !== undefined) continue
+      const raw = use.input.todos
+      if (Array.isArray(raw)) todos = raw.map(parseTodo).filter((todo): todo is Todo => todo !== undefined)
+    }
+    for (const line of parseManualLines(message.text)) {
+      if (!manualLines.includes(line)) manualLines.push(line)
+    }
+  }
+  return { todos, manualLines }
+}
+
+/** Builds a fresh checklist from what the transcript seed found. */
+export function checklistFromSeed(seed: { todos: Todo[] | undefined; manualLines: string[] }): Checklist {
+  let list = seed.todos === undefined ? EMPTY_CHECKLIST : mergeTodos(EMPTY_CHECKLIST, seed.todos).list
+  for (const line of seed.manualLines) list = addManual(list, line).list
+  return list
+}

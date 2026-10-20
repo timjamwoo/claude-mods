@@ -26,6 +26,13 @@ live session in the band above the prompt: project, a one-sentence summary,
 open item count. The current session is marked with `▶`. Sessions with no
 update for 24 hours are dimmed as stale. Nothing here needs a Claude turn.
 
+**Restarts, resumes and older sessions.** A session keeps its id across a
+restart or `claude --resume`, so at startup the mod reads its own board
+file back, ticks included. A session that predates the mod has no file, so
+the mod reads the transcript instead and seeds the checklist from the last
+TodoWrite call and any `MANUAL:` lines Claude wrote. Neither sends Claude a
+note, since Claude already knows all of it.
+
 **`/board`** prints the full board: every session, its open items, and the
 `claude --resume` command to get back to it. **`/board prune`** asks, then
 removes the files of stale or ended sessions.
@@ -34,6 +41,58 @@ The summary comes from the in-progress todo, then the first pending todo,
 then the first line of your last prompt. Only when the todo list is empty
 does the mod ask Haiku for one sentence, at most once every five minutes.
 Turn that off with the `haikuSummary` option in `/config`.
+
+## Share the board across machines and cloud sessions
+
+By default the board is the local folder, so each machine sees only its own
+sessions. To see every session on one board, give the mod a secret GitHub
+gist. Each session then also writes its JSON document to the gist as a file
+named `<session-id>.json`, with a partial update that touches only that file,
+and polls the gist every fifteen seconds. Unchanged polls are answered with a
+304 through an ETag and do not count against the GitHub rate limit.
+
+Create a secret gist with one placeholder file. From a terminal with the
+GitHub CLI signed in:
+
+```sh
+echo "cc-board shared board" | gh gist create --desc cc-board --filename cc-board.md -
+```
+
+The last part of the printed URL is the gist id. You can also create it at
+gist.github.com; it needs any one file to exist.
+
+Then a token. A classic personal access token with only the `gist` scope is
+enough, and fine-grained tokens do not cover gists. The token the GitHub CLI
+already holds usually has that scope, and `gh auth token` prints it.
+
+On your Mac, put both in the mod's options in `~/.claude/settings.json`. The
+key is `cc-board@inline` for a mod loaded with `--plugin-dir` or
+`CLAUDE_CODE_PLUGIN_DIRS`, and `cc-board@claude-mods` once installed from the
+marketplace:
+
+```json
+{
+  "pluginConfigs": {
+    "cc-board@inline": {
+      "boardGist": "0123456789abcdef0123456789abcdef",
+      "boardToken": "ghp_your_token"
+    }
+  }
+}
+```
+
+In a cloud environment, set `CC_BOARD_GIST` and `CC_BOARD_TOKEN` as
+environment variables on the environment, allow `api.github.com` in its
+network policy, and load the mod there with `CLAUDE_CODE_PLUGIN_DIRS` after a
+setup script clones this repository into the container. Anyone who can use
+that environment can read its variables, which is why the token should carry
+the `gist` scope and nothing else.
+
+Each session is tagged with where it runs, `cloud` or the Mac's host name,
+and the band shows the tag for sessions on other machines. `/board prune`
+removes stale sessions from the gist as well as the local folder. If the gist
+cannot be reached, the mod shows one toast, logs the reason, and carries on
+with the local board.
 
 ## Install for development
 
@@ -95,25 +154,26 @@ claude plugin test cc-board
 `validate` lists every event the mod hooks and every call it makes. `test`
 runs the files under `tests/`: the board file round trip and malformed
 files, `MANUAL:` parsing, keeping ticked items done through a TodoWrite
-update, the note sent to Claude, and the band on the terminal and desktop
-surfaces.
+update, the note sent to Claude, the band on the terminal and desktop
+surfaces, and both restore paths at startup.
 
 ## Files
 
 - `hooks/register.tsx` wires the events to the engine: commands, the pane,
   the band, the poll, the board file writes.
 - `hooks/checklist.ts` is the checklist logic, pure functions only.
-- `hooks/board.ts` is the board file shape, the stale rule and the text the
-  band and `/board` print.
+- `hooks/board.ts` is the board file shape, the stale rule, the merge of
+  local and shared sessions, and the text the band and `/board` print.
+- `hooks/gist.ts` builds the gist requests and reads the gist's files.
 - `types/index.d.ts` declares the values kept in `$.state`.
 - `tests/` holds the tests `claude plugin test` runs.
 
 ## What it does not do
 
 It never answers or changes a tool call, and the only text it adds to a
-request is the checklist note. It makes no network calls apart from the
-optional Haiku summary, which goes through your own Claude Code
-credentials. A missing board folder or a malformed board file is logged to
+request is the checklist note. Its only network calls are the optional Haiku
+summary, through your own Claude Code credentials, and the gist reads and
+writes once you configure a gist. A missing board folder or a malformed board file is logged to
 the debug log (`claude --debug`) and skipped.
 
 There is no way for a mod to set the terminal tab title, and Claude Code

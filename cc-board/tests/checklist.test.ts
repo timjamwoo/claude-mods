@@ -3,10 +3,12 @@ import { describe, expect, test } from 'claude-code/testing'
 import {
   EMPTY_CHECKLIST,
   addManual,
+  checklistFromSeed,
   describeChanges,
   mergeTodos,
   parseItemId,
   parseManualLines,
+  seedFromTranscript,
   setTicked,
 } from '../hooks/checklist'
 
@@ -102,5 +104,33 @@ describe('describeChanges and parseItemId', () => {
     expect(parseItemId('3')).toBe(3)
     expect(parseItemId(' #12 ')).toBe(12)
     expect(parseItemId('three')).toBe(undefined)
+  })
+})
+
+describe('seedFromTranscript', () => {
+  const todoUse = (todos: unknown, agentId?: string) => ({ tool: 'TodoWrite', input: { todos }, ...(agentId === undefined ? {} : { agentId }) })
+
+  test('takes the last main-loop TodoWrite and every MANUAL: line', async () => {
+    const seed = seedFromTranscript([
+      { role: 'user', text: 'MANUAL: not from Claude, ignored', toolUses: [] },
+      { role: 'assistant', text: 'Starting.', toolUses: [todoUse([{ content: 'Old item', status: 'pending' }])] },
+      { role: 'assistant', text: 'MANUAL: Rotate the key', toolUses: [todoUse([{ content: 'Fix login', status: 'in_progress' }, { content: 'bad', status: 'nope' }, 42])] },
+      { role: 'assistant', text: 'Subagent work', toolUses: [todoUse([{ content: 'Agent item', status: 'pending' }], 'agent-1')] },
+      { role: 'assistant', text: '- MANUAL: Rotate the key\n- MANUAL: Submit the build', toolUses: [] },
+    ])
+    expect(seed.todos).toEqual([{ content: 'Fix login', status: 'in_progress' }])
+    expect(seed.manualLines).toEqual(['Rotate the key', 'Submit the build'])
+
+    const list = checklistFromSeed(seed)
+    expect(list.items.map(item => [item.id, item.text, item.source, item.status])).toEqual([
+      [1, 'Fix login', 'todo', 'in_progress'],
+      [2, 'Rotate the key', 'manual', 'pending'],
+      [3, 'Submit the build', 'manual', 'pending'],
+    ])
+  })
+
+  test('an empty or todo-free transcript seeds nothing', async () => {
+    expect(seedFromTranscript([])).toEqual({ todos: undefined, manualLines: [] })
+    expect(checklistFromSeed(seedFromTranscript([{ role: 'assistant', text: 'hi', toolUses: [] }]))).toEqual(EMPTY_CHECKLIST)
   })
 })
