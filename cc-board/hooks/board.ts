@@ -31,11 +31,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function parseItem(value: unknown): ChecklistItem | undefined {
   if (!isRecord(value)) return undefined
-  const { id, text, source, status, ticked } = value
+  const { id, text, source, status, ticked, taskId } = value
   if (typeof id !== 'number' || typeof text !== 'string') return undefined
   if (source !== 'todo' && source !== 'manual') return undefined
   if (!STATUSES.includes(status as ItemStatus)) return undefined
-  return { id, text, source, status: status as ItemStatus, ticked: ticked === true }
+  const item: ChecklistItem = { id, text, source, status: status as ItemStatus, ticked: ticked === true }
+  if (typeof taskId === 'string' && taskId !== '') item.taskId = taskId
+  return item
 }
 
 /**
@@ -92,19 +94,33 @@ export function isLive(session: BoardSession, nowMs: number): boolean {
 }
 
 /**
- * The cheap summary: the in-progress todo first, then the first pending one,
- * then the start of the last prompt. `fromTodo` says whether the todo list
+ * A prompt as a person wrote it: the tagged blocks Claude Code injects
+ * (`<task-notification>`, `<artifact-view-context ...>` and the like) and
+ * any line that is only a tag are dropped.
+ */
+export function cleanPrompt(text: string): string {
+  const withoutBlocks = text.replace(/<([a-zA-Z][\w-]*)\b[^>]*>[\s\S]*?<\/\1\s*>/g, '\n')
+  return withoutBlocks
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => line !== '' && !/^<[^>]*>$/.test(line))
+    .join('\n')
+}
+
+/**
+ * The cheap summary: the in-progress task first, then the first pending one,
+ * then the start of the last prompt. `fromTask` says whether the task list
  * gave an answer, so the caller knows when a model call might help.
  */
 export function cheapSummary(
   items: readonly ChecklistItem[],
   lastPrompt: string,
-): { text: string; fromTodo: boolean } {
-  const todos = items.filter(item => item.source === 'todo')
-  const active = todos.find(item => item.status === 'in_progress') ?? todos.find(item => item.status === 'pending')
-  if (active !== undefined) return { text: clip(active.text, 100), fromTodo: true }
-  const firstLine = lastPrompt.split('\n').find(line => line.trim() !== '') ?? ''
-  return { text: clip(firstLine, 100), fromTodo: false }
+): { text: string; fromTask: boolean } {
+  const tasks = items.filter(item => item.source === 'todo')
+  const active = tasks.find(item => item.status === 'in_progress') ?? tasks.find(item => item.status === 'pending')
+  if (active !== undefined) return { text: clip(active.text, 100), fromTask: true }
+  const firstLine = cleanPrompt(lastPrompt).split('\n')[0] ?? ''
+  return { text: clip(firstLine, 100), fromTask: false }
 }
 
 function age(session: BoardSession, nowMs: number): string {
@@ -123,7 +139,7 @@ function age(session: BoardSession, nowMs: number): string {
 export function boardLine(session: BoardSession, isCurrent: boolean, nowMs: number, homeMachine?: string): string {
   const open = openItems(session.items).length
   const marker = isCurrent ? '▶' : ' '
-  const summary = session.summary === '' ? '(no summary yet)' : session.summary
+  const summary = session.summary === '' ? '—' : session.summary
   const where = session.machine !== undefined && session.machine !== homeMachine ? ` · @${session.machine}` : ''
   const stale = isStale(session, nowMs) ? ` · stale ${age(session, nowMs)}` : ''
   return `${marker} ${session.project} · ${summary} · ${open} open${where}${stale}`

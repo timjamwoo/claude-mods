@@ -17,21 +17,24 @@ import type { BoardSession, Checklist, ChecklistItem } from '../types'
 import {
   EMPTY_CHECKLIST,
   addManual,
-  checklistFromSeed,
+  applyTaskEvent,
   describeChanges,
   mergeTodos,
   openItems,
   parseItemId,
   parseManualLines,
+  reconcile,
   seedFromTranscript,
   setTicked,
   type Change,
+  type TaskEvent,
   type Todo,
 } from './checklist'
 import {
   basename,
   boardLine,
   cheapSummary,
+  cleanPrompt,
   clip,
   fileFor,
   fullBoardText,
@@ -308,25 +311,42 @@ async function flushChanges($: EngineInterface): Promise<void> {
 
 // ---- Summary --------------------------------------------------------------
 
+/**
+ * The summary: an in-progress or pending task wins. Otherwise, with Haiku on,
+ * the last Haiku sentence stays until a new one is made (at most one call per
+ * HAIKU_GAP_MS, and only when the prompt changed); the raw prompt shows only
+ * before the first call. With Haiku off, the prompt's first line is used.
+ */
 async function refreshSummary($: EngineInterface, mayCallModel: boolean): Promise<void> {
   const list = await read($, checklist)
   const cheap = cheapSummary(list.items, lastPrompt)
   let text = cheap.text
 
-  if (!cheap.fromTodo && lastPrompt !== '') {
-    if (haikuPrompt === lastPrompt && haikuText !== '') {
-      text = haikuText
-    } else if (mayCallModel && useHaiku) {
+  if (!cheap.fromTask && useHaiku) {
+    if (mayCallModel && lastPrompt !== '' && haikuPrompt !== lastPrompt) {
       const now = await $.clock.now()
       if (now - haikuAt > HAIKU_GAP_MS) {
         haikuAt = now
         haikuPrompt = lastPrompt
-        haikuText = await askHaiku($)
-        if (haikuText !== '') text = haikuText
+        const fresh = await askHaiku($)
+        if (fresh !== '') haikuText = fresh
       }
     }
+    if (haikuText !== '') text = haikuText
   }
   await update($, summary, () => text)
+}
+
+async function applyTask($: EngineInterface, event: TaskEvent): Promise<void> {
+  let kept: ChecklistItem | undefined
+  await update($, checklist, (list: Checklist) => {
+    const result = applyTaskEvent(list, event)
+    kept = result.keptDone
+    return result.list
+  })
+  if (kept !== undefined) queueChange($, { kind: 'kept-done', item: kept })
+  await refreshSummary($, false)
+  await writeBoardFile($)
 }
 
 async function askHaiku($: EngineInterface): Promise<string> {
@@ -334,8 +354,8 @@ async function askHaiku($: EngineInterface): Promise<string> {
     const reply = await $.model.complete({
       model: 'haiku',
       system:
-        'You summarize what a coding session is working on. Answer with one plain sentence of at most twelve words, no quotes, no preamble.',
-      prompt: `User's latest request:\n${clip(lastPrompt, 1500)}\n\nAssistant's latest reply:\n${clip(lastAnswer, 1500)}`,
+        'You write a one-line status for a board of coding sessions. Answer with one plain phrase of at most twelve words that says what the session is working on, starting with a verb ending in -ing, such as "Fixing the login crash on iOS". No quotes, no preamble, no mention of the user or the assistant. The excerpts may be cut short; never remark on that.',
+      prompt: `Latest request:\n${clip(lastPrompt, 1500)}\n\nEnd of the latest reply:\n${tail(lastAnswer, 1500)}`,
       maxTokens: 60,
       effort: 'low',
       timeoutMs: 8000,
@@ -411,6 +431,9 @@ async function bindSession($: EngineInterface): Promise<void> {
   pending = []
   lastPrompt = ''
   lastAnswer = ''
+  haikuText = ''
+  haikuPrompt = ''
+  haikuAt = 0
 }
 
 /**
@@ -426,9 +449,11 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
       if (await $.fs.exists(path)) {
         const saved = parse(await $.fs.read(path))
         if (saved !== undefined) {
-          // The file is authoritative even with no items: it may still hold a summary.
+          // The file wins (ticks, manual steps, summary), topped up with any task
+          // the transcript knows and the file does not, as after an upgrade.
           const nextId = Math.max(0, ...saved.items.map(item => item.id)) + 1
-          await update($, checklist, () => ({ items: saved.items, nextId }))
+          const list = reconcile({ items: saved.items, nextId }, await replayTranscript($))
+          await update($, checklist, () => list)
           await update($, summary, () => saved.summary)
           return 'file'
         }
@@ -441,17 +466,27 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
   try {
     const messages = await $.session.messages()
     if ('deny' in messages) return 'none'
-    const seed = seedFromTranscript(messages)
-    const list = checklistFromSeed(seed)
-    if (list.items.length === 0) return 'none'
+    const list = seedFromTranscript(messages)
+    const lastUser = [...messages].reverse().find(message => message.role === 'user' && cleanPrompt(message.text) !== '')
+    lastPrompt = cleanPrompt(lastUser?.text ?? '')
+    if (list.items.length === 0 && lastPrompt === '') return 'none'
     await update($, checklist, () => list)
-    const lastUser = [...messages].reverse().find(message => message.role === 'user')
-    lastPrompt = lastUser?.text ?? ''
     await refreshSummary($, false)
     return 'transcript'
   } catch (error) {
     log($, `seed from transcript failed: ${String(error)}`)
     return 'none'
+  }
+}
+
+/** The checklist the transcript implies, or an empty one when it cannot be read. */
+async function replayTranscript($: EngineInterface): Promise<Checklist> {
+  try {
+    const messages = await $.session.messages()
+    return 'deny' in messages ? EMPTY_CHECKLIST : seedFromTranscript(messages)
+  } catch (error) {
+    log($, `transcript replay failed: ${String(error)}`)
+    return EMPTY_CHECKLIST
   }
 }
 
@@ -500,6 +535,12 @@ async function pruneBoard($: EngineInterface): Promise<string> {
   await refreshBoard($)
   const where = remoteNames.length > 0 ? ` (${remoteNames.length} from the shared gist${remoteOk ? '' : ', which failed'})` : ''
   return `cc-board: removed ${stale.length} session(s)${where}.`
+}
+
+/** The last `max` characters of a text on one line, with a leading ellipsis when cut. */
+function tail(text: string, max: number): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim()
+  return oneLine.length <= max ? oneLine : `…${oneLine.slice(oneLine.length - max + 1)}`
 }
 
 function itemMark(item: ChecklistItem): string {
@@ -579,6 +620,39 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // The Task tools, which newer builds use in place of TodoWrite. The call runs
+  // first, so a created task's id is known and a refused update changes nothing.
+  on('tool.call', { tool: 'TaskCreate' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (e.agentId === undefined && ran.deny === undefined) {
+      try {
+        const task = (ran.result as { task?: { id?: unknown } } | undefined)?.task
+        if (typeof task?.id === 'string') await applyTask($, { kind: 'created', taskId: task.id, subject: e.subject })
+      } catch (error) {
+        log($, `TaskCreate failed: ${String(error)}`)
+      }
+    }
+    return ran
+  })
+
+  on('tool.call', { tool: 'TaskUpdate' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (e.agentId === undefined && ran.deny === undefined) {
+      try {
+        const ok = (ran.result as { success?: unknown } | undefined)?.success !== false
+        if (ok) {
+          const event: TaskEvent = { kind: 'updated', taskId: e.taskId }
+          if (e.status !== undefined) event.status = e.status
+          if (e.subject !== undefined) event.subject = e.subject
+          await applyTask($, event)
+        }
+      } catch (error) {
+        log($, `TaskUpdate failed: ${String(error)}`)
+      }
+    }
+    return ran
+  })
+
   // Lines Claude writes that start with "MANUAL:" become manual steps.
   on('session.append', { door: 'response' }, async ($, e, next) => {
     if (e.agentId === undefined) {
@@ -594,9 +668,21 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // Only what a person typed feeds the summary: notifications, scheduled
+  // triggers and other sessions' messages are not what this session works on.
+  on('prompt.submit', async ($, e, next) => {
+    const kind = e.origin.kind
+    const isTyped = e.isMeta !== true && e.command === undefined && (kind === 'composer' || kind === 'bridge' || kind === 'sdk')
+    if (isTyped) {
+      // A typed prompt that is nothing but markup is still the person's request.
+      const typed = cleanPrompt(e.text) || (e.text.split('\n').find(line => line.trim() !== '') ?? '').trim()
+      if (typed !== '') lastPrompt = typed
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('turn.start', async ($, e, next) => {
-    if (e.agentId === undefined && e.text.trim() !== '') {
-      lastPrompt = e.text
+    if (e.agentId === undefined) {
       await refreshSummary($, false)
       await writeBoardFile($)
     }
@@ -664,7 +750,7 @@ export const register: Register = (on, options) => {
             {current}
           </Text>
         )}
-        {list.items.length === 0 && <Text dimColor>No items yet. Claude’s todos and /manual steps show here.</Text>}
+        {list.items.length === 0 && <Text dimColor>No tasks yet. /manual {'<text>'} adds a step of your own.</Text>}
         {list.items.map(item => (
           <Button
             key={`item-${item.id}`}
@@ -674,7 +760,7 @@ export const register: Register = (on, options) => {
             onPress={() => void toggleItem($, item.id)}
           />
         ))}
-        <Text dimColor>Click or Tab+Enter ticks an item. /done {'<id>'} works too.</Text>
+        {list.items.length > 0 && <Text dimColor>Click an item to tick it, or /done {'<id>'}.</Text>}
       </Box>
     )
   })

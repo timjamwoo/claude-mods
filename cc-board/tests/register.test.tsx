@@ -40,6 +40,7 @@ const BAND = {
 function fakeWorld(on: On, transcript: SessionMessage[] = []) {
   const files = new Map<string, { text: string; mtimeMs: number }>()
   let tick = 0
+  let taskCount = 0
 
   on('fs.write', (_, e) => {
     files.set(e.path, { text: e.text, mtimeMs: ++tick })
@@ -83,6 +84,8 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('tool.call', (_, e) => {
     // $.ui.ask reaches the test as an AskUserQuestion call: answer "Remove" to every question.
+    if (e.tool === 'TaskCreate') return { result: { task: { id: `task-${++taskCount}`, subject: e.subject } } }
+    if (e.tool === 'TaskUpdate') return { result: { success: true, taskId: e.taskId, updatedFields: ['status'] } }
     if (e.tool === 'AskUserQuestion') {
       const answers: Record<string, string> = {}
       for (const question of e.questions) answers[question.question] = 'Remove'
@@ -230,7 +233,7 @@ test('the band lists every live session, marks this one and dims stale ones', as
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
     const mine = await ui.find({ type: 'Text', text: /my-app/ })
-    expect(mine?.text).toBe('▶ my-app · (no summary yet) · 0 open')
+    expect(mine?.text).toBe('▶ my-app · — · 0 open')
     expect(mine?.props.bold).toBe(true)
     const theirs = await ui.find({ type: 'Text', text: /other-repo/ })
     expect(theirs?.text).toBe('  other-repo · Adding the settings page · 1 open')
@@ -291,6 +294,26 @@ test('a session that predates the mod is seeded from its transcript, without a n
   expect(file?.summary).toBe('Fix login')
   await world.clock.advance(300)
   expect(world.noteCount()).toBe(0)
+})
+
+test('a saved file is topped up with tasks the transcript knows, keeping its ticks', async ($, on) => {
+  const world = fakeWorld(on, [
+    {
+      role: 'assistant',
+      text: 'Planned.',
+      toolUses: [{ tool_use_id: 'x', tool: 'TaskCreate', input: { subject: 'Fix login', description: 'd' }, result: { task: { id: 't1', subject: 'Fix login' } } }],
+    },
+  ])
+  world.put(
+    `${BOARD_DIR}/sess-A.json`,
+    JSON.stringify({ sessionId: 'sess-A', project: 'my-app', cwd: '/work/my-app', summary: 'Fixing login', items: [{ id: 1, text: 'Rotate key', source: 'manual', status: 'completed', ticked: true }], updatedAt: '2026-10-20T11:00:00Z' }),
+  )
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  expect(world.boardFile('sess-A')?.items.map(item => [item.id, item.text, item.status, item.ticked, item.taskId])).toEqual([
+    [1, 'Rotate key', 'completed', true, undefined],
+    [2, 'Fix login', 'pending', false, 't1'],
+  ])
+  expect(world.boardFile('sess-A')?.summary).toBe('Fixing login')
 })
 
 test('a board file with no items still restores its saved summary', async ($, on) => {
@@ -383,4 +406,73 @@ test('sessions from the gist join the band, polls reuse the etag, and prune dele
   const result = await $.command.run({ command: 'board', args: 'prune', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
   expect(result?.text).toContain('removed 1 session(s) (1 from the shared gist)')
   expect(Object.keys(remote.gist.files).sort()).toEqual(['sess-A.json', 'sess-cloud.json'])
+})
+
+test('TaskCreate and TaskUpdate drive the checklist, and a ticked task survives a reopen', async ($, on) => {
+  const world = fakeWorld(on)
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'TaskCreate', subject: 'Fix login', description: 'The null ref' })
+  await $.tool.call({ tool: 'TaskCreate', subject: 'Rotate key', description: 'In the portal' })
+  await $.tool.call({ tool: 'TaskUpdate', taskId: 'task-1', status: 'in_progress' })
+
+  let file = world.boardFile('sess-A')
+  expect(file?.items.map(item => [item.id, item.text, item.status, item.taskId])).toEqual([
+    [1, 'Fix login', 'in_progress', 'task-1'],
+    [2, 'Rotate key', 'pending', 'task-2'],
+  ])
+  expect(file?.summary).toBe('Fix login')
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'item-2' })
+  await ui.unmount()
+  await $.tool.call({ tool: 'TaskUpdate', taskId: 'task-2', status: 'in_progress' })
+  file = world.boardFile('sess-A')
+  expect(file?.items[1]?.status).toBe('completed')
+  await world.clock.advance(300)
+  expect(world.lastNote()).toContain('stay done')
+  expect(world.lastNote()).toContain('#2 "Rotate key"')
+})
+
+test('a Haiku summary stays until the next one, and the raw prompt is only a first fallback', async ($, on) => {
+  const world = fakeWorld(on)
+  let asked = 0
+  on('model.complete', () => {
+    asked += 1
+    return { value: { isAnswered: true, text: 'Fixing the login crash', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
+  })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+
+  const typed = (text: string) => $.prompt.submit({ text, origin: { kind: 'composer' }, wait: false })
+  await typed('<task-notification>\n<status>x</status>\n</task-notification>\nthe login page crashes on launch')
+  await $.turn.start({ text: 'the login page crashes on launch', turnId: 't1' })
+  expect(world.boardFile('sess-A')?.summary).toBe('the login page crashes on launch')
+  await $.turn.complete({ turnId: 't1', answer: 'On it.', durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(world.boardFile('sess-A')?.summary).toBe('Fixing the login crash')
+  expect(asked).toBe(1)
+
+  // A new prompt within the five-minute gap keeps the Haiku sentence instead of the raw prompt.
+  await world.clock.advance(60_000)
+  await typed('ok and what about the claude prompt update?')
+  await $.turn.start({ text: 'ok and what about the claude prompt update?', turnId: 't2' })
+  await $.turn.complete({ turnId: 't2', answer: 'Done.', durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(world.boardFile('sess-A')?.summary).toBe('Fixing the login crash')
+  expect(asked).toBe(1)
+
+  // Past the gap, the next completed turn asks again.
+  await world.clock.advance(5 * 60_000)
+  await typed('now the settings page')
+  await $.turn.start({ text: 'now the settings page', turnId: 't3' })
+  await $.turn.complete({ turnId: 't3', answer: 'Done.', durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(asked).toBe(2)
+
+  // A background notification is not a request: it neither becomes the summary nor calls Haiku.
+  await world.clock.advance(5 * 60_000)
+  await $.prompt.submit({ text: 'Task finished: build 42', origin: { kind: 'task-notification' }, wait: false })
+  await $.turn.start({ text: 'Task finished: build 42', turnId: 't4' })
+  await $.turn.complete({ turnId: 't4', answer: 'Noted.', durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(asked).toBe(2)
+  expect(world.boardFile('sess-A')?.summary).toBe('Fixing the login crash')
 })
