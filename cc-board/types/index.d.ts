@@ -43,6 +43,8 @@ export type BoardSession = {
   machine?: string
   /** The terminal the session runs in, such as /dev/ttys003, when it has one. */
   tty?: string
+  /** Where a cloud session opens in a browser or the Desktop app: its claude.ai/code page. */
+  url?: string
 }
 
 declare module 'claude-code' {

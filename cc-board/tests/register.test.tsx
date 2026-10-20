@@ -37,7 +37,7 @@ const BAND = {
 } as const
 
 /** A fake file system that answers $.fs and the mv/rm the mod runs. */
-function fakeWorld(on: On, transcript: SessionMessage[] = []) {
+function fakeWorld(on: On, transcript: SessionMessage[] = [], env: Record<string, string> = {}) {
   const files = new Map<string, { text: string; mtimeMs: number }>()
   let tick = 0
   let taskCount = 0
@@ -78,12 +78,20 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
       scripts.push(script)
       stdout = [...terminalTtys].some(one => script.includes(`"${one}"`)) ? 'ok\n' : 'none\n'
     }
-    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    // The system opener exists on the Mac, not in a cloud container.
+    let exitCode = 0
+    if (command === 'open' || command === 'xdg-open') {
+      if ('CLAUDE_CODE_REMOTE_SDK_URL' in env) exitCode = 127
+      else opened.push(args[0] ?? '')
+    }
+    return { value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   // Terminal tabs the fake AppleScript can find, by tty, and the scripts it was handed.
   const terminalTtys = new Set<string>()
   const scripts: string[] = []
   const copied: string[] = []
+  // The URLs handed to the system opener.
+  const opened: string[] = []
   on('ui.copy', (_, e) => {
     copied.push(e.text)
     return { value: { isCopied: true } }
@@ -112,7 +120,7 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
     }
     return { result: {} }
   })
-  mock.env(on, { HOME })
+  mock.env(on, { HOME, ...env })
 
   const clock = mock.clock(on, { now: Date.parse('2026-10-20T12:00:00Z') })
   const session = mock.session(on)
@@ -131,7 +139,7 @@ function fakeWorld(on: On, transcript: SessionMessage[] = []) {
   }
   const noteCount = () => session.appended().filter(one => one.door === 'note').length
 
-  return { files, clock, session, boardFile, put, lastNote, noteCount, toasts, terminalTtys, scripts, copied }
+  return { files, clock, session, boardFile, put, lastNote, noteCount, toasts, terminalTtys, scripts, copied, opened }
 }
 
 const TODOS = [
@@ -595,12 +603,13 @@ test('/board prune sweeps rows hidden behind the read cap even when nothing stal
   expect(remote.table.size).toBe(501)
 })
 
-test('a click on a board line raises that session’s terminal, or copies how to resume it', async ($, on) => {
+test('a click on a board line raises that session’s terminal, opens its page, or copies how to resume it', async ($, on) => {
   const world = fakeWorld(on)
   world.terminalTtys.add('/dev/ttys007')
   const base = { project: 'other-repo', cwd: '/work/other-repo', summary: 'Adding the settings page', items: [], updatedAt: '2026-10-20T11:59:00Z' }
   world.put(`${BOARD_DIR}/sess-B.json`, JSON.stringify({ ...base, sessionId: 'sess-B', machine: 'mbp', tty: '/dev/ttys007' }))
   world.put(`${BOARD_DIR}/sess-C.json`, JSON.stringify({ ...base, sessionId: 'sess-C', project: 'cloud-repo', cwd: '/home/user/cloud-repo', machine: 'cloud' }))
+  world.put(`${BOARD_DIR}/sess-D.json`, JSON.stringify({ ...base, sessionId: 'sess-D', project: 'cloud-repo', cwd: '/home/user/cloud-repo', machine: 'cloud', url: 'https://claude.ai/code/session_01D' }))
   await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
   expect(world.boardFile('sess-A')?.tty).toBe('/dev/ttys003')
   await world.clock.advance(2000)
@@ -616,8 +625,30 @@ test('a click on a board line raises that session’s terminal, or copies how to
   expect(world.copied).toEqual(['cd /home/user/cloud-repo && claude --resume sess-C'])
   expect(world.toasts.at(-1)).toContain('it runs on cloud')
 
+  // A cloud session that recorded its page opens there instead of copying.
+  await ui.press({ key: 'session-sess-D' })
+  expect(world.opened).toEqual(['https://claude.ai/code/session_01D'])
+  expect(world.copied.length).toBe(1)
+  expect(world.toasts.at(-1)).toBe('opened cloud-repo in your browser')
+
   await ui.press({ key: 'session-sess-A' })
   expect(world.toasts.at(-1)).toBe('that is this session')
+  await ui.unmount()
+})
+
+test('a cloud session records its claude.ai page, and a click from the cloud falls back to copying', async ($, on) => {
+  const world = fakeWorld(on, [], { CLAUDE_CODE_REMOTE_SDK_URL: 'https://api.anthropic.com/v1/code/sessions/cse_01A', CLAUDE_CODE_REMOTE_SESSION_ID: 'cse_01A' })
+  world.put(`${BOARD_DIR}/sess-D.json`, JSON.stringify({ sessionId: 'sess-D', project: 'cloud-repo', cwd: '/home/user/cloud-repo', summary: '', items: [], updatedAt: '2026-10-20T11:59:00Z', machine: 'cloud', url: 'https://claude.ai/code/session_01D' }))
+  await $.session.start({ cwd: '/home/user/my-app', surface: 'terminal', isInteractive: true })
+  const mine = world.boardFile('sess-A')
+  expect(mine?.machine).toBe('cloud')
+  expect(mine?.url).toBe('https://claude.ai/code/session_01A')
+  await world.clock.advance(2000)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'session-sess-D' })
+  expect(world.opened).toEqual([])
+  expect(world.copied).toEqual(['cd /home/user/cloud-repo && claude --resume sess-D'])
   await ui.unmount()
 })
 
