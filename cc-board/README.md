@@ -55,7 +55,7 @@ Create a secret gist with one placeholder file. From a terminal with the
 GitHub CLI signed in:
 
 ```sh
-gh gist create --desc cc-board <(echo cc-board shared board)
+echo "cc-board shared board" | gh gist create --desc cc-board --filename cc-board.md -
 ```
 
 The last part of the printed URL is the gist id. You can also create it at
