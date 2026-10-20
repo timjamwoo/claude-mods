@@ -283,3 +283,14 @@ test('a session that predates the mod is seeded from its transcript, without a n
   await world.clock.advance(300)
   expect(world.noteCount()).toBe(0)
 })
+
+test('a board file with no items still restores its saved summary', async ($, on) => {
+  const world = fakeWorld(on, [{ role: 'user', text: 'Rotate the signing key', toolUses: [] }])
+  world.put(
+    `${BOARD_DIR}/sess-A.json`,
+    JSON.stringify({ sessionId: 'sess-A', project: 'my-app', cwd: '/work/my-app', summary: 'Rotating the signing key', items: [], updatedAt: '2026-10-20T11:00:00Z' }),
+  )
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  expect(world.boardFile('sess-A')?.summary).toBe('Rotating the signing key')
+  expect(world.boardFile('sess-A')?.items).toEqual([])
+})

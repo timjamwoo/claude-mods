@@ -292,7 +292,8 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
       const path = fileFor(boardDir, sessionId)
       if (await $.fs.exists(path)) {
         const saved = parse(await $.fs.read(path))
-        if (saved !== undefined && saved.items.length > 0) {
+        if (saved !== undefined) {
+          // The file is authoritative even with no items: it may still hold a summary.
           const nextId = Math.max(0, ...saved.items.map(item => item.id)) + 1
           await update($, checklist, () => ({ items: saved.items, nextId }))
           await update($, summary, () => saved.summary)
