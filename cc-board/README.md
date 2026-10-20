@@ -94,22 +94,21 @@ alter table public.cc_board enable row level security;
 ```
 
 Then copy a secret key from the project's API settings, the `service_role`
-key or a new secret key. On your Mac, put the project URL and that key in
-the mod's options in `~/.claude/settings.json`. The key is
-`cc-board@inline` for a mod loaded with `--plugin-dir` or
-`CLAUDE_CODE_PLUGIN_DIRS`, and `cc-board@claude-mods` once installed from
-the marketplace:
+key or a new secret key. On your Mac, enter the project URL and that key
+through the mod's options dialog, not by editing `settings.json`: run
+`/plugin`, open the **Installed** tab, select cc-board and choose
+**Configure options** (a marketplace install shows the same dialog as it
+installs). The URL lands in `~/.claude/settings.json` under
+`pluginConfigs`, and the key, which the manifest marks sensitive, goes to
+the macOS Keychain. A key written into `settings.json` by hand is dropped
+the next time Claude Code saves that file, because sensitive options never
+live there.
 
-```json
-{
-  "pluginConfigs": {
-    "cc-board@inline": {
-      "boardUrl": "https://yourproject.supabase.co",
-      "boardKey": "your secret key"
-    }
-  }
-}
-```
+If the dialog is not offered for the way you loaded the mod, set both
+values as environment variables instead: `CC_BOARD_URL` and `CC_BOARD_KEY`
+under `env` in `~/.claude/settings.json`, or in your shell profile. Claude
+Code leaves the `env` block alone when it saves settings. That keeps the
+key in a plain file, so prefer the dialog where it is available.
 
 In a cloud environment, set `CC_BOARD_URL` and `CC_BOARD_KEY` as
 environment variables on the environment and allow the project's host in
