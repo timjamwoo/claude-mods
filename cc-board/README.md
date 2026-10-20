@@ -102,11 +102,11 @@ the macOS Keychain. A key written into `settings.json` by hand is dropped
 the next time Claude Code saves that file, because sensitive options never
 live there.
 
-If the dialog is not offered for the way you loaded the mod, set the key as
-an environment variable instead: `CC_BOARD_KEY` under `env` in
-`~/.claude/settings.json`, or in your shell profile. Claude Code leaves the
-`env` block alone when it saves settings. That keeps the key in a plain
-file, so prefer the dialog where it is available.
+If the dialog is not offered for the way you loaded the mod, set both
+values as environment variables instead: `CC_BOARD_URL` and `CC_BOARD_KEY`
+under `env` in `~/.claude/settings.json`, or in your shell profile. Claude
+Code leaves the `env` block alone when it saves settings. That keeps the
+key in a plain file, so prefer the dialog where it is available.
 
 In a cloud environment, set `CC_BOARD_URL` and `CC_BOARD_KEY` as
 environment variables on the environment and allow the project's host in
