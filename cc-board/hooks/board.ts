@@ -57,7 +57,7 @@ export function parse(text: string): BoardSession | undefined {
 /** As `parse`, for a value already decoded from JSON. */
 export function parseValue(raw: unknown): BoardSession | undefined {
   if (!isRecord(raw)) return undefined
-  const { sessionId, project, cwd, summary, items, updatedAt, endedAt, machine, tty } = raw
+  const { sessionId, project, cwd, summary, items, updatedAt, endedAt, machine, tty, url } = raw
   if (typeof sessionId !== 'string' || sessionId === '') return undefined
   if (typeof project !== 'string' || typeof cwd !== 'string') return undefined
   if (typeof updatedAt !== 'string' || Number.isNaN(Date.parse(updatedAt))) return undefined
@@ -73,6 +73,7 @@ export function parseValue(raw: unknown): BoardSession | undefined {
   if (typeof endedAt === 'string') session.endedAt = endedAt
   if (typeof machine === 'string' && machine !== '') session.machine = machine
   if (typeof tty === 'string' && tty.startsWith('/dev/')) session.tty = tty
+  if (typeof url === 'string' && url.startsWith('https://')) session.url = url
   return session
 }
 
@@ -173,7 +174,7 @@ function mark(item: ChecklistItem): string {
   return '[ ]'
 }
 
-/** What /board prints: every session, its open items and how to resume it. */
+/** What /board prints: every session, its open items and how to get back to it. */
 export function fullBoardText(sessions: readonly BoardSession[], currentId: string, nowMs: number, homeMachine?: string): string {
   if (sessions.length === 0) return 'cc-board: no sessions on the board yet.'
   const lines: string[] = [`cc-board · ${sessions.length} session(s)`, '']
@@ -189,7 +190,8 @@ export function fullBoardText(sessions: readonly BoardSession[], currentId: stri
     }
     lines.push(`    cwd: ${session.cwd}`)
     const elsewhere = session.machine !== undefined && session.machine !== homeMachine ? `  (on ${session.machine})` : ''
-    lines.push(`    resume: cd ${session.cwd} && claude --resume ${session.sessionId}${elsewhere}`)
+    if (session.url !== undefined) lines.push(`    open: ${session.url}`)
+    else lines.push(`    resume: cd ${session.cwd} && claude --resume ${session.sessionId}${elsewhere}`)
     lines.push('')
   }
   return lines.join('\n').trimEnd()

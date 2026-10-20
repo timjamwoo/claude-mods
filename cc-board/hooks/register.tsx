@@ -75,6 +75,8 @@ let cwd = ''
 let project = ''
 let machine = ''
 let tty = ''
+// A cloud session's claude.ai/code page, '' elsewhere.
+let sessionUrl = ''
 let boardDir = ''
 
 // The shared table, when configured.
@@ -129,6 +131,7 @@ async function writeBoardFile($: EngineInterface, endedAt?: string): Promise<voi
     if (endedAt !== undefined) snapshot.endedAt = endedAt
     if (machine !== '') snapshot.machine = machine
     if (tty !== '') snapshot.tty = tty
+    if (sessionUrl !== '') snapshot.url = sessionUrl
 
     // $.fs.write is not atomic, so write a temp file and rename it into place.
     const target = fileFor(boardDir, sessionId)
@@ -265,17 +268,41 @@ async function raiseTerminal($: EngineInterface, target: string): Promise<boolea
   return false
 }
 
-/** What a click on a board line does: raise that session's terminal, or copy how to get back to it. */
+/** Hands a URL to the system opener, so a claude.ai/code page lands in the browser or the Desktop app. */
+async function openUrl($: EngineInterface, url: string): Promise<boolean> {
+  for (const opener of ['open', 'xdg-open']) {
+    try {
+      const ran = await $.process.run([opener, url], { timeoutMs: 8000 })
+      if (ran.exitCode === 0) return true
+    } catch (error) {
+      log($, `${opener} failed: ${String(error)}`)
+    }
+  }
+  return false
+}
+
+/** What a click on a board line does: raise that session's terminal, open its page, or copy how to get back to it. */
 async function switchToSession($: EngineInterface, target: BoardSession, surface: RenderSurface): Promise<void> {
   if (target.sessionId === sessionId) {
     $.ui.toast('that is this session')
     return
   }
   if (target.tty !== undefined && target.machine === machine && (await raiseTerminal($, target.tty))) return
+  if (target.url !== undefined && (await openUrl($, target.url))) {
+    $.ui.toast(`opened ${target.project} in your browser`)
+    return
+  }
   const command = `cd ${target.cwd} && claude --resume ${target.sessionId}`
   const copied = await $.ui.copy({ text: command, surface }).catch(() => ({ isCopied: false as const, reason: 'failed' }))
   const where = target.machine !== undefined && target.machine !== machine ? ` (it runs on ${target.machine})` : ''
   $.ui.toast(copied.isCopied ? `resume command copied${where}` : `resume with: ${command}`)
+}
+
+/** A cloud session's claude.ai/code page, from the id the cloud sets in the environment; '' for a local session. */
+async function detectSessionUrl($: EngineInterface): Promise<string> {
+  const remoteId = ((await $.env.get('CLAUDE_CODE_REMOTE_SESSION_ID')) ?? '').trim()
+  const match = /^cse_([A-Za-z0-9]+)$/.exec(remoteId)
+  return match === null ? '' : `https://claude.ai/code/session_${match[1]}`
 }
 
 /** A short label for where this session runs: "cloud", or the host name. */
@@ -737,6 +764,7 @@ export const register: Register = (on, options) => {
       if (boardDir === '') log($, 'HOME is unset, so no board file is written')
       machine = await detectMachine($)
       tty = await detectTty($)
+      sessionUrl = await detectSessionUrl($)
       await configureRemote($)
     } catch (error) {
       log($, `start failed: ${String(error)}`)

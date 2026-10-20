@@ -78,6 +78,15 @@ describe('summary and lines', () => {
     expect(fullBoardText([], 'sess-a', NOW)).toContain('no sessions')
   })
 
+  test('a cloud session keeps its page through a round trip and the full board shows it instead of a resume command', async () => {
+    const cloud = { ...session, sessionId: 'sess-c', machine: 'cloud', url: 'https://claude.ai/code/session_01C' }
+    expect(parse(serialize(cloud))?.url).toBe('https://claude.ai/code/session_01C')
+    expect(parse(serialize({ ...cloud, url: 'javascript:alert(1)' } as typeof cloud))?.url).toBeUndefined()
+    const text = fullBoardText([cloud], 'sess-a', NOW, 'mbp')
+    expect(text).toContain('open: https://claude.ai/code/session_01C')
+    expect(text).not.toContain('claude --resume sess-c')
+  })
+
   test('basename handles trailing slashes', async () => {
     expect(basename('/Users/me/src/my-app/')).toBe('my-app')
     expect(basename('my-app')).toBe('my-app')

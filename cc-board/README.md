@@ -47,9 +47,12 @@ note, since Claude already knows all of it.
 **Click a session to switch to it.** Each band line is a button. A session
 records the terminal it runs in, and a click asks Terminal.app, then
 iTerm2, to bring that tab to the front. macOS asks once to let your
-terminal control them. A session the click cannot reach, a cloud session
-or one in the Desktop app, gets its resume command copied to the clipboard
-instead, with a toast saying so.
+terminal control them. A cloud session records its claude.ai/code page,
+and a click opens that page with the system opener, so it lands in the
+browser or the Desktop app, whichever handles the link. A session the
+click cannot reach any other way, such as one in the Desktop app on
+another Mac, gets its resume command copied to the clipboard instead, with
+a toast saying so.
 
 **`/board scan`** reads the whole conversation for loose ends, newest
 first, in chunks, with at most eight Haiku calls, which is what to run on a
@@ -57,7 +60,7 @@ long chat that predates the mod or has things lingering from earlier. The
 same scan runs by itself the first time the mod meets a session.
 
 **`/board`** prints the full board: every session, its open items, and the
-`claude --resume` command to get back to it. **`/board prune`** asks, then
+`claude --resume` command or the claude.ai page to get back to it. **`/board prune`** asks, then
 removes the files of stale or ended sessions.
 
 The summary comes from the in-progress task, then the first pending task,
