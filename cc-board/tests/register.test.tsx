@@ -179,6 +179,9 @@ test('a ticked item stays done when TodoWrite reopens it, and Claude is told', a
   // Tick item 2 in the pane.
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'item-2' })
+  // A ticked item leaves the open list; the toggle brings the done ones back.
+  expect(await ui.find({ key: 'item-2' })).toBeUndefined()
+  await ui.press({ key: 'toggle-done' })
   expect((await ui.find({ key: 'item-2' }))?.props.label).toBe('[x] #2 Rotate key')
   await ui.unmount()
   expect(world.boardFile('sess-A')?.items[1]).toEqual({ id: 2, text: 'Rotate key', source: 'todo', status: 'completed', ticked: true })
@@ -312,6 +315,7 @@ test('a restarted or resumed session takes its checklist back from its own board
   await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'toggle-done' })
   expect((await ui.find({ key: 'item-4' }))?.props.label).toBe('[x] #4 Rotate key (manual)')
   await ui.unmount()
 
@@ -670,6 +674,86 @@ test('a cloud session records its claude.ai page, and a click from the cloud fal
   await ui.press({ key: 'session-sess-D' })
   expect(world.opened).toEqual([])
   expect(world.copied).toEqual(['cd /home/user/cloud-repo && claude --resume sess-D'])
+  await ui.unmount()
+})
+
+test('the session title from the classic hooks names the session on the board, and a rename follows', async ($, on) => {
+  const world = fakeWorld(on)
+  on('classic.SessionStart', () => ({}))
+  on('classic.UserPromptSubmit', () => ({}))
+  await $.session.start({ cwd: '/work/my-app', surface: 'desktop', isInteractive: true })
+  expect(world.boardFile('sess-A')?.title).toBeUndefined()
+
+  await $.classic.SessionStart({ source: 'startup', session_title: 'Main Storied Thread (Local)' })
+  expect(world.boardFile('sess-A')?.title).toBe('Main Storied Thread (Local)')
+  await world.clock.advance(2000)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ type: 'Button', text: /Main Storied/ }))?.text).toBe('▶ Main Storied Thread (Local) · — · 0 open')
+    expect(await ui.find({ type: 'Text', text: /^Main Storied Thread \(Local\) · 0 open$/ })).toBeDefined()
+    await ui.unmount()
+  }
+
+  await $.classic.UserPromptSubmit({ prompt: 'carry on', session_title: 'Storied remote' })
+  expect(world.boardFile('sess-A')?.title).toBe('Storied remote')
+})
+
+test('a turn that does a loose end ticks it off, and the pane hides done items until asked', async ($, on) => {
+  const world = fakeWorld(on)
+  const asked: string[] = []
+  on('model.complete', (_, e) => {
+    asked.push(e.prompt)
+    const text = e.prompt.startsWith('Checklist:') ? '#1' : e.prompt.startsWith('Already on the checklist') ? 'NONE' : 'Working'
+    return { value: { isAnswered: true, text, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
+  })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'manual', args: 'Rotate the API key in the portal', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  await $.command.run({ command: 'manual', args: 'Bump the version before release', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  await world.clock.advance(300)
+
+  // A reply with no words in common with any item asks nothing.
+  await $.prompt.submit({ text: 'fix the login crash', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'fix the login crash', turnId: 't1' })
+  await $.turn.complete({ turnId: 't1', answer: 'Fixed the null reference and added a test.', durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(asked.filter(prompt => prompt.startsWith('Checklist:')).length).toBe(0)
+
+  // A reply that did the work: one question, naming only the item it touches on, and that item is done.
+  await $.prompt.submit({ text: 'rotate the key for me', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'rotate the key for me', turnId: 't2' })
+  await $.turn.complete({ turnId: 't2', answer: 'Rotated the API key in the portal and updated the config.', durationMs: 10, isAborted: false, reason: 'answer' })
+  const questions = asked.filter(prompt => prompt.startsWith('Checklist:'))
+  expect(questions.length).toBe(1)
+  expect(questions[0]).toContain('#1 Rotate the API key in the portal')
+  expect(questions[0]).not.toContain('#2')
+  expect(world.boardFile('sess-A')?.items.map(item => [item.id, item.status, item.ticked])).toEqual([
+    [1, 'completed', false],
+    [2, 'pending', false],
+  ])
+  await world.clock.advance(300)
+  expect(world.lastNote()).toContain('handled them')
+  expect(world.lastNote()).toContain('#1 "Rotate the API key in the portal"')
+
+  // The pane shows open items only, with a toggle that reveals the done ones.
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'item-1' })).toBeUndefined()
+    expect((await ui.find({ key: 'item-2' }))?.props.label).toBe('[ ] #2 Bump the version before release (manual)')
+    expect((await ui.find({ key: 'toggle-done' }))?.props.label).toBe('show 1 done')
+    await ui.press({ key: 'toggle-done' })
+    expect((await ui.find({ key: 'item-1' }))?.props.label).toBe('[x] #1 Rotate the API key in the portal (manual)')
+    expect((await ui.find({ key: 'toggle-done' }))?.props.label).toBe('hide 1 done')
+    await ui.press({ key: 'toggle-done' })
+    await ui.unmount()
+  }
+
+  // /board done is the keyboard route to the same toggle.
+  const result = await $.command.run({ command: 'board', args: 'done', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(result?.text).toContain('shown')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ key: 'item-1' })).toBeDefined()
   await ui.unmount()
 })
 

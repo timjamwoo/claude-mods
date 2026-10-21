@@ -1,15 +1,20 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import {
-  EMPTY_CHECKLIST,
   addFollowUp,
   addManual,
   applyTaskEvent,
+  candidatesHandled,
   cueExcerpts,
   describeChanges,
+  EMPTY_CHECKLIST,
   hasLooseEndCue,
+  isSimilar,
+  keywords,
+  markHandled,
   mergeTodos,
   parseFollowUpLines,
+  parseHandledIds,
   parseItemId,
   parseManualLines,
   reconcile,
@@ -134,6 +139,21 @@ describe('applyTaskEvent', () => {
     expect(reopened.keptDone?.id).toBe(1)
   })
 
+  test('a TaskCreate that reads like an open loose end adopts it, so the task finishing finishes the item', async () => {
+    const start = addFollowUp(EMPTY_CHECKLIST, 'Renew the push certificate in the portal').list
+    const created = applyTaskEvent(start, { kind: 'created', taskId: 't-9', subject: 'Renew push certificate' })
+    expect(created.list.items.length).toBe(1)
+    expect(created.item?.taskId).toBe('t-9')
+    expect(created.item?.source).toBe('followup')
+    const finished = applyTaskEvent(created.list, { kind: 'updated', taskId: 't-9', status: 'completed' })
+    expect(finished.list.items[0]?.status).toBe('completed')
+    // A completed loose end is not adopted again, and an unrelated task is its own item.
+    const other = applyTaskEvent(finished.list, { kind: 'created', taskId: 't-10', subject: 'Renew the push certificate' })
+    expect(other.list.items.length).toBe(2)
+    const unrelated = applyTaskEvent(start, { kind: 'created', taskId: 't-11', subject: 'Fix the login crash' })
+    expect(unrelated.list.items.length).toBe(2)
+  })
+
   test('a TaskCreate for a todo of the same text attaches the id instead of duplicating', async () => {
     const fromTodo = mergeTodos(EMPTY_CHECKLIST, [{ content: 'Fix login', status: 'pending', activeForm: 'x' }]).list
     const { list } = applyTaskEvent(fromTodo, { kind: 'created', taskId: 't9', subject: 'Fix login' })
@@ -194,6 +214,46 @@ describe('seedFromTranscript', () => {
   test('an empty or task-free transcript seeds nothing', async () => {
     expect(seedFromTranscript([])).toEqual(EMPTY_CHECKLIST)
     expect(seedFromTranscript([{ role: 'assistant', text: 'hi', toolUses: [] }])).toEqual(EMPTY_CHECKLIST)
+  })
+})
+
+describe('handled items', () => {
+  const items = [
+    { id: 1, text: 'Rotate the API key in the portal', source: 'followup' as const, status: 'pending' as const, ticked: false },
+    { id: 2, text: 'Bump the version before release', source: 'manual' as const, status: 'pending' as const, ticked: false },
+    { id: 3, text: 'Fix the login crash', source: 'todo' as const, status: 'pending' as const, ticked: false },
+    { id: 4, text: 'Rotate the signing key', source: 'followup' as const, status: 'completed' as const, ticked: true },
+  ]
+
+  test('keywords and isSimilar ignore short and stop words', async () => {
+    expect(keywords('Renew the push certificate, then make sure it is done')).toEqual(['renew', 'push', 'certificate'])
+    expect(isSimilar('Renew the push certificate in the portal', 'Renew push certificate')).toBe(true)
+    expect(isSimilar('Renew the push certificate', 'Fix the login crash')).toBe(false)
+    expect(isSimilar('Bump the version', 'Bump the build number before release')).toBe(false)
+  })
+
+  test('candidatesHandled keeps only open manual steps and loose ends the text touches on', async () => {
+    const text = 'User: did you rotate it?\n\nClaude: I rotated the API key in the portal and updated the config.'
+    expect(candidatesHandled(items, text).map(item => item.id)).toEqual([1])
+    expect(candidatesHandled(items, 'Fixed the login crash.')).toEqual([])
+  })
+
+  test('parseHandledIds reads numbers in any common shape and ignores the rest', async () => {
+    const candidates = items.slice(0, 2)
+    expect(parseHandledIds('#1\n2', candidates)).toEqual([1, 2])
+    expect(parseHandledIds('- 2\n- 2\n#3', candidates)).toEqual([2])
+    expect(parseHandledIds('NONE', candidates)).toEqual([])
+    expect(parseHandledIds('Item 1 is done', candidates)).toEqual([])
+  })
+
+  test('markHandled completes the named open items without claiming a tick', async () => {
+    const result = markHandled({ items, nextId: 5 }, [1, 4])
+    expect(result.items.map(item => item.id)).toEqual([1])
+    expect(result.list.items[0]).toEqual({ ...items[0], status: 'completed' })
+    const note = describeChanges([{ kind: 'auto-done', item: result.items[0]! }])
+    expect(note).toContain('handled them')
+    expect(note).toContain('#1 "Rotate the API key in the portal"')
+    expect(note).toContain('Do not remind')
   })
 })
 

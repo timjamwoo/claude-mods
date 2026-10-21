@@ -19,11 +19,14 @@ import {
   addFollowUp,
   addManual,
   applyTaskEvent,
+  candidatesHandled,
   cueExcerpts,
   describeChanges,
   hasLooseEndCue,
+  markHandled,
   mergeTodos,
   openItems,
+  parseHandledIds,
   parseItemId,
   parseFollowUpLines,
   parseManualLines,
@@ -40,6 +43,7 @@ import {
   cheapSummary,
   cleanPrompt,
   clip,
+  displayName,
   fileFor,
   fullBoardText,
   isLive,
@@ -63,11 +67,14 @@ const HAIKU_GAP_MS = 5 * 60 * 1000
 const checklist = atom({ plugin: 'cc-board', key: 'checklist' } as const, EMPTY_CHECKLIST)
 const summary = atom({ plugin: 'cc-board', key: 'summary' } as const, '')
 const board = atom({ plugin: 'cc-board', key: 'board' } as const, [])
+// Whether the pane lists completed items too. Off by default, so a long session stays short.
+const showDone = atom({ plugin: 'cc-board', key: 'showDone' } as const, false)
 
 // ---- Module state (a hot reload resets it; session.start refills it) ------
 
 let useHaiku = true
 let useFollowUps = true
+let useAutoDone = true
 // Whether the sessions are also drawn in the band above the prompt.
 let showBand = false
 let pluginOptions: PluginOptions = {}
@@ -75,6 +82,8 @@ let pluginOptions: PluginOptions = {}
 let sessionId = ''
 let cwd = ''
 let project = ''
+// The session's title, as the Desktop app lists it; '' until a classic hook carries one.
+let title = ''
 let machine = ''
 let tty = ''
 // A cloud session's claude.ai/code page, '' elsewhere.
@@ -130,6 +139,7 @@ async function writeBoardFile($: EngineInterface, endedAt?: string): Promise<voi
       items: list.items,
       updatedAt: new Date(now).toISOString(),
     }
+    if (title !== '') snapshot.title = title
     if (endedAt !== undefined) snapshot.endedAt = endedAt
     if (machine !== '') snapshot.machine = machine
     if (tty !== '') snapshot.tty = tty
@@ -291,7 +301,7 @@ async function switchToSession($: EngineInterface, target: BoardSession, surface
   }
   if (target.tty !== undefined && target.machine === machine && (await raiseTerminal($, target.tty))) return
   if (target.url !== undefined && (await openUrl($, target.url))) {
-    $.ui.toast(`opened ${target.project} in your browser`)
+    $.ui.toast(`opened ${displayName(target)} in your browser`)
     return
   }
   const command = `cd ${target.cwd} && claude --resume ${target.sessionId}`
@@ -585,6 +595,50 @@ async function scanTranscript($: EngineInterface, messages: readonly { role: 'us
   return found
 }
 
+/**
+ * Ticks off the manual steps and loose ends that an exchange shows were done,
+ * whoever did them. Only items sharing words with the exchange are put to
+ * Haiku, so most turns cost nothing. Resolves how many were marked done.
+ */
+async function tickHandled($: EngineInterface, text: string): Promise<number> {
+  if (!useAutoDone) return 0
+  const list = await read($, checklist)
+  const candidates = candidatesHandled(list.items, text)
+  if (candidates.length === 0) return 0
+  let ids: number[] = []
+  try {
+    const reply = await $.model.complete({
+      model: 'haiku',
+      system:
+        'You keep a checklist for a developer. Read the exchange and decide which checklist items it shows as finished: the assistant did the work in this exchange, or the user says they did it. An item that is only mentioned, planned, started, or advised about is not finished. Answer with the numbers of the finished items, one per line, or NONE.',
+      prompt: `Checklist:\n${candidates.map(item => `#${item.id} ${item.text}`).join('\n')}\n\nExchange:\n${clip(text, 6000)}`,
+      maxTokens: 60,
+      effort: 'low',
+      timeoutMs: 8000,
+    })
+    if (!reply.isAnswered) {
+      log($, `handled check skipped: ${reply.reason}`)
+      return 0
+    }
+    ids = parseHandledIds(reply.text, candidates)
+  } catch (error) {
+    log($, `handled check failed: ${String(error)}`)
+    return 0
+  }
+  if (ids.length === 0) return 0
+  let done: ChecklistItem[] = []
+  await update($, checklist, (list: Checklist) => {
+    const result = markHandled(list, ids)
+    done = result.items
+    return result.list
+  })
+  for (const item of done) {
+    queueChange($, { kind: 'auto-done', item })
+    $.ui.toast(`#${item.id} done: ${clip(item.text, 60)}`)
+  }
+  return done.length
+}
+
 /** Adds the loose ends found in `text` to the checklist and tells Claude. Resolves how many were new. */
 async function surfaceFollowUps($: EngineInterface, text: string): Promise<number> {
   if (!useFollowUps || !hasLooseEndCue(text)) return 0
@@ -752,6 +806,14 @@ function itemLabel(item: ChecklistItem): string {
 
 // ---- Hooks ----------------------------------------------------------------
 
+/** Records a changed session title and rewrites the board file so the other sessions see it. */
+async function noteTitle($: EngineInterface, fresh: string | undefined): Promise<void> {
+  const next = (fresh ?? '').trim()
+  if (next === title) return
+  title = next
+  await writeBoardFile($)
+}
+
 /** The sessions the pane and the band list: every one not ended, this one first. */
 async function liveSessions($: EngineInterface): Promise<{ rows: BoardSession[]; now: number }> {
   const all = await read($, board)
@@ -762,6 +824,7 @@ async function liveSessions($: EngineInterface): Promise<{ rows: BoardSession[];
 export const register: Register = (on, options) => {
   useHaiku = options.haikuSummary !== false
   useFollowUps = options.followUps !== false
+  useAutoDone = options.autoDone !== false
   showBand = options.band === true
   pluginOptions = options
 
@@ -794,6 +857,16 @@ export const register: Register = (on, options) => {
     const restored = await restoreChecklist($)
     if (restored !== 'none') log($, `checklist restored from ${restored}`)
     await writeBoardFile($)
+    return next(e)
+  })
+
+  // The session's title rides on the classic hooks: at start, and on every prompt, so a /rename shows.
+  on('classic.SessionStart', async ($, e, next) => {
+    await noteTitle($, e.session_title)
+    return next(e)
+  })
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    await noteTitle($, e.session_title)
     return next(e)
   })
 
@@ -901,7 +974,9 @@ export const register: Register = (on, options) => {
       lastAnswer = e.answer
       await refreshSummary($, true)
       if (e.reason === 'answer' && e.answer.trim() !== '') {
-        await surfaceFollowUps($, `User: ${clip(lastPrompt, 2000)}\n\nClaude: ${e.answer}`)
+        const exchange = `User: ${clip(lastPrompt, 2000)}\n\nClaude: ${e.answer}`
+        await tickHandled($, exchange)
+        await surfaceFollowUps($, exchange)
       }
       await writeBoardFile($)
     }
@@ -936,6 +1011,11 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'board' }, async ($, e) => {
     await refreshBoard($)
     if (e.args.trim() === 'prune') return { text: await pruneBoard($) }
+    if (e.args.trim() === 'done') {
+      const shown = await update($, showDone, (value: boolean) => !value)
+      void $.ui.open({ id: PANE, title: 'cc-board' })
+      return { text: shown ? 'cc-board: completed items shown.' : 'cc-board: completed items hidden.' }
+    }
     if (e.args.trim() === 'scan') {
       if (!useFollowUps) return { text: 'cc-board: loose-end scans are off (followUps).' }
       try {
@@ -961,6 +1041,9 @@ export const register: Register = (on, options) => {
     const list = await read($, checklist)
     const current = await read($, summary)
     const open = openItems(list.items).length
+    const doneCount = list.items.length - open
+    const showingDone = await read($, showDone)
+    const shown = showingDone ? list.items : openItems(list.items)
     const { rows, now } = await liveSessions($)
 
     return (
@@ -976,7 +1059,7 @@ export const register: Register = (on, options) => {
         ))}
         {rows.length > 0 && <Text> </Text>}
         <Text bold>
-          {project} · {open} open
+          {title === '' ? project : title} · {open} open
         </Text>
         {current !== '' && (
           <Text dimColor wrap="truncate-end">
@@ -984,7 +1067,7 @@ export const register: Register = (on, options) => {
           </Text>
         )}
         {list.items.length === 0 && <Text dimColor>No tasks yet. /manual {'<text>'} adds a step of your own.</Text>}
-        {list.items.map(item => (
+        {shown.map(item => (
           <Button
             key={`item-${item.id}`}
             plain
@@ -993,6 +1076,15 @@ export const register: Register = (on, options) => {
             onPress={() => void toggleItem($, item.id)}
           />
         ))}
+        {doneCount > 0 && (
+          <Button
+            key="toggle-done"
+            plain
+            dimColor
+            label={showingDone ? `hide ${doneCount} done` : `show ${doneCount} done`}
+            onPress={() => void update($, showDone, (value: boolean) => !value)}
+          />
+        )}
         {list.items.length > 0 && <Text dimColor>Click an item to tick it, or /done {'<id>'}.</Text>}
       </Box>
     )

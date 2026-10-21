@@ -13,6 +13,15 @@ rows. Manual steps you have to do yourself join them, from `/manual <text>`
 or from any line in Claude's reply that starts with `MANUAL:`. Each row is a
 button: click it in the Desktop Code tab or in a fullscreen terminal, or
 Tab to it and press Enter. `/done <id>` ticks an item from the keyboard.
+Done items are hidden; a `show N done` button at the foot of the list, or
+`/board done`, brings them back.
+
+**Handled items tick themselves.** Claude's own tasks complete through the
+Task tools. A manual step or loose end is ticked when a later exchange
+shows the work done, by Claude or by you. Only items that share words with
+the exchange are put to Haiku, so most turns cost nothing. A task Claude
+takes on that reads like an open loose end adopts it, so the task finishing
+finishes the item. Turn the Haiku check off with the `autoDone` option.
 
 **Loose ends get surfaced.** The real point of the checklist is the small
 things said in passing and then forgotten: "you'll need to rotate the key
@@ -33,7 +42,8 @@ note says so, so Claude stops reminding you and does not add it back.
 **A live board of all sessions.** Each session writes
 `~/.claude/board/<session-id>.json` (atomically, temp file plus rename).
 Every session polls that folder every two seconds and draws one line per
-live session at the top of the pane: project, a one-sentence summary, open
+live session at the top of the pane: the session's title as the Desktop app
+lists it (its repo name until it has one), a one-sentence summary, open
 item count. The current session is marked with `▶`. Sessions with no update
 for 24 hours are dimmed as stale. Nothing here needs a Claude turn. The
 `band` option draws the same lines above the prompt as well, for a terminal
@@ -200,11 +210,12 @@ desktop surfaces, and both restore paths at startup.
 ## What it does not do
 
 It never answers or changes a tool call, and the only text it adds to a
-request is the checklist note. It makes three kinds of network call, each
+request is the checklist note. It makes four kinds of network call, each
 with its own switch: the Haiku summary (`haikuSummary`), the Haiku
-loose-end scan of an exchange that carries a cue phrase (`followUps`), both
-through your own Claude Code credentials, and the table reads and writes
-once a shared board is configured (`boardUrl`). With all three off it
+loose-end scan of an exchange that carries a cue phrase (`followUps`), the
+Haiku check of whether an exchange handled an open item (`autoDone`), all
+three through your own Claude Code credentials, and the table reads and
+writes once a shared board is configured (`boardUrl`). With all four off it
 touches nothing outside the machine. A missing board folder or a malformed board file is logged to
 the debug log (`claude --debug`) and skipped.
 
