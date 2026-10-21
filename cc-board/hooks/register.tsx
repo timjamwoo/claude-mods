@@ -662,6 +662,7 @@ async function bindSession($: EngineInterface): Promise<void> {
   sessionId = await $.session.id()
   const repo = await $.session.repo().catch(() => null)
   project = basename(repo?.root ?? cwd)
+  title = ''
   pending = []
   lastPrompt = ''
   lastAnswer = ''
@@ -860,26 +861,26 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // The session's title rides on the classic hooks: at start, and on every prompt, so a /rename shows.
+  // /clear, /resume and /branch start a new session id without a session.start, so the session is
+  // rebound first; only then is the title the event carries written, under the right session id.
   on('classic.SessionStart', async ($, e, next) => {
-    await noteTitle($, e.session_title)
-    return next(e)
-  })
-  on('classic.UserPromptSubmit', async ($, e, next) => {
-    await noteTitle($, e.session_title)
-    return next(e)
-  })
-
-  // /clear, /resume and /branch start a new session id without a session.start.
-  on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
     try {
-      cwd = await $.session.cwd()
-      await bindSession($)
-      if (e.source !== 'clear') await restoreChecklist($)
+      if (e.source === 'clear' || e.source === 'resume' || e.source === 'fork') {
+        cwd = await $.session.cwd()
+        await bindSession($)
+        if (e.source !== 'clear') await restoreChecklist($)
+      }
+      title = (e.session_title ?? '').trim()
       await writeBoardFile($)
     } catch (error) {
       log($, `rebind failed: ${String(error)}`)
     }
+    return next(e)
+  })
+
+  // The title rides on every prompt too, so a /rename shows on the next one.
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    await noteTitle($, e.session_title)
     return next(e)
   })
 

@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
+import type { Checklist } from '../types'
 
 import {
   addFollowUp,
@@ -152,6 +153,30 @@ describe('applyTaskEvent', () => {
     expect(other.list.items.length).toBe(2)
     const unrelated = applyTaskEvent(start, { kind: 'created', taskId: 't-11', subject: 'Fix the login crash' })
     expect(unrelated.list.items.length).toBe(2)
+    // Deleting an adopted task leaves the obligation, without the link; deleting a plain task removes it.
+    const dropped = applyTaskEvent(created.list, { kind: 'updated', taskId: 't-9', status: 'deleted' })
+    expect(dropped.list.items).toEqual([{ id: 1, text: 'Renew the push certificate in the portal', source: 'followup', status: 'pending', ticked: false }])
+    const plain = applyTaskEvent(EMPTY_CHECKLIST, { kind: 'created', taskId: 't-12', subject: 'Fix login' }).list
+    expect(applyTaskEvent(plain, { kind: 'updated', taskId: 't-12', status: 'deleted' }).list.items).toEqual([])
+  })
+
+  test('replay adopts a MANUAL: step by the task that followed it, and reconcile carries that over the saved file', async () => {
+    const replayed = seedFromTranscript([
+      { role: 'assistant', text: 'MANUAL: Renew the push certificate in the portal', toolUses: [] },
+      { role: 'assistant', text: 'On it.', toolUses: [{ tool: 'TaskCreate', input: { subject: 'Renew push certificate' }, result: { task: { id: 't-9' } } }] },
+      { role: 'assistant', text: 'Done.', toolUses: [{ tool: 'TaskUpdate', input: { taskId: 't-9', status: 'completed' }, result: { success: true } }] },
+    ])
+    expect(replayed.items).toEqual([{ id: 1, text: 'Renew the push certificate in the portal', source: 'manual', status: 'pending', ticked: false, taskId: 't-9', }].map(item => ({ ...item, status: 'completed' })))
+
+    // A file written before the adoption still holds the step open: the replay finishes it instead of adding a twin.
+    const saved: Checklist = { items: [{ id: 1, text: 'Renew the push certificate in the portal', source: 'manual', status: 'pending', ticked: false }], nextId: 2 }
+    const merged = reconcile(saved, replayed)
+    expect(merged.items).toEqual([{ id: 1, text: 'Renew the push certificate in the portal', source: 'manual', status: 'completed', ticked: false, taskId: 't-9' }])
+
+    // Once the file carries the link, a renamed adopted item matches by task id, so no twin appears.
+    const linked: Checklist = { items: [{ ...saved.items[0]!, taskId: 't-9' }], nextId: 2 }
+    const renamed = { ...replayed, items: [{ ...replayed.items[0]!, text: 'Renew the APNs certificate' }] }
+    expect(reconcile(linked, renamed).items.map(item => [item.id, item.status])).toEqual([[1, 'completed']])
   })
 
   test('a TaskCreate for a todo of the same text attaches the id instead of duplicating', async () => {
@@ -184,8 +209,8 @@ describe('seedFromTranscript', () => {
     ])
     expect(list.items.map(item => [item.id, item.text, item.source, item.status, item.taskId])).toEqual([
       [2, 'Fix login', 'todo', 'in_progress', undefined],
-      [3, 'Add tests', 'todo', 'in_progress', 't1'],
-      [4, 'Rotate the key', 'manual', 'pending', undefined],
+      [3, 'Rotate the key', 'manual', 'pending', undefined],
+      [4, 'Add tests', 'todo', 'in_progress', 't1'],
       [5, 'Submit the build', 'manual', 'pending', undefined],
     ])
   })
@@ -230,6 +255,7 @@ describe('handled items', () => {
     expect(isSimilar('Renew the push certificate in the portal', 'Renew push certificate')).toBe(true)
     expect(isSimilar('Renew the push certificate', 'Fix the login crash')).toBe(false)
     expect(isSimilar('Bump the version', 'Bump the build number before release')).toBe(false)
+    expect(isSimilar('Renew production signing certificate', 'Renew staging signing certificate')).toBe(false)
   })
 
   test('candidatesHandled keeps only open manual steps and loose ends the text touches on', async () => {

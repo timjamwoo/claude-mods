@@ -48,7 +48,12 @@ export function applyTaskEvent(list: Checklist, event: TaskEvent): { list: Check
 
   const found = list.items.find(item => item.taskId === event.taskId)
   if (found === undefined) return { list }
-  if (event.status === 'deleted') return { list: { ...list, items: list.items.filter(item => item !== found) }, item: found }
+  if (event.status === 'deleted') {
+    // A deleted task takes its own item with it; an adopted manual step or loose end only loses the link.
+    if (found.source === 'todo') return { list: { ...list, items: list.items.filter(item => item !== found) }, item: found }
+    const { taskId: _dropped, ...detached } = found
+    return { list: { ...list, items: list.items.map(item => (item === found ? detached : item)) }, item: detached }
+  }
 
   let item: ChecklistItem = { ...found }
   if (event.subject !== undefined && event.subject.trim() !== '') item.text = event.subject.trim()
@@ -136,13 +141,16 @@ export function keywords(text: string): string[] {
   return [...found]
 }
 
-/** True when two texts share at least two keywords and most of the shorter text's keywords. */
+/**
+ * True when one text says the same as the other with extra words: every keyword
+ * of the shorter is in the longer, and there are at least two. A differing
+ * word on either side ("staging" against "production") keeps them apart.
+ */
 export function isSimilar(a: string, b: string): boolean {
   const left = keywords(a)
-  const right = new Set(keywords(b))
-  const shared = left.filter(word => right.has(word)).length
-  const shorter = Math.min(left.length, right.size)
-  return shared >= 2 && shared * 10 >= shorter * 6
+  const right = keywords(b)
+  const [shorter, longer] = left.length <= right.length ? [left, new Set(right)] : [right, new Set(left)]
+  return shorter.length >= 2 && shorter.every(word => longer.has(word))
 }
 
 /**
@@ -327,17 +335,19 @@ function updateFailed(result: unknown): boolean {
 export function reconcile(saved: Checklist, replayed: Checklist): Checklist {
   let list = saved
   for (const item of replayed.items) {
-    if (item.source === 'manual' || item.source === 'followup') {
-      list = addItem(list, item.text, item.source).list
-      continue
-    }
-    const known = list.items.find(one => (item.taskId !== undefined && one.taskId === item.taskId) || (one.source === 'todo' && one.text === item.text))
+    const key = normalizeText(item.text)
+    const known =
+      (item.taskId !== undefined ? list.items.find(one => one.taskId === item.taskId) : undefined) ??
+      list.items.find(one => (item.source === 'todo' ? one.source === 'todo' && one.text === item.text : normalizeText(one.text) === key))
     if (known === undefined) {
       list = { items: [...list.items, { ...item, id: list.nextId }], nextId: list.nextId + 1 }
-    } else if (known.taskId === undefined && item.taskId !== undefined) {
-      const linked = { ...known, taskId: item.taskId }
-      list = { ...list, items: list.items.map(one => (one === known ? linked : one)) }
+      continue
     }
+    let updated = known
+    if (updated.taskId === undefined && item.taskId !== undefined) updated = { ...updated, taskId: item.taskId }
+    // A task the transcript shows finished finishes the item it adopted, whatever the file said.
+    if (item.taskId !== undefined && item.status === 'completed' && updated.status !== 'completed') updated = { ...updated, status: 'completed' }
+    if (updated !== known) list = { ...list, items: list.items.map(one => (one === known ? updated : one)) }
   }
   return list
 }
@@ -357,7 +367,6 @@ function createdTaskId(result: unknown): string | undefined {
  */
 export function seedFromTranscript(messages: readonly TranscriptMessage[]): Checklist {
   let list = EMPTY_CHECKLIST
-  const manualLines: string[] = []
 
   for (const message of messages) {
     if (message.role !== 'assistant') continue
@@ -380,11 +389,8 @@ export function seedFromTranscript(messages: readonly TranscriptMessage[]): Chec
         list = applyTaskEvent(list, event).list
       }
     }
-    for (const line of parseManualLines(message.text)) {
-      if (!manualLines.includes(line)) manualLines.push(line)
-    }
+    // Message by message, so a MANUAL: step written before Claude takes it on as a task is adopted by that task.
+    for (const line of parseManualLines(message.text)) list = addManual(list, line).list
   }
-
-  for (const line of manualLines) list = addManual(list, line).list
   return list
 }

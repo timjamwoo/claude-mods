@@ -103,9 +103,11 @@ function fakeWorld(on: On, transcript: SessionMessage[] = [], env: Record<string
   })
   on('ui.log', () => ({ value: undefined }))
 
-  on('session.id', () => ({ value: 'sess-A' }))
+  let currentId = 'sess-A'
+  on('session.id', () => ({ value: currentId }))
   on('session.messages', () => ({ value: transcript }))
   on('session.repo', () => ({ value: null }))
+  on('session.cwd', () => ({ value: '/work/my-app' }))
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -139,7 +141,10 @@ function fakeWorld(on: On, transcript: SessionMessage[] = [], env: Record<string
   }
   const noteCount = () => session.appended().filter(one => one.door === 'note').length
 
-  return { files, clock, session, boardFile, put, lastNote, noteCount, toasts, terminalTtys, scripts, copied, opened }
+  const setSessionId = (id: string) => {
+    currentId = id
+  }
+  return { files, clock, session, boardFile, put, lastNote, noteCount, toasts, terminalTtys, scripts, copied, opened, setSessionId }
 }
 
 const TODOS = [
@@ -696,6 +701,12 @@ test('the session title from the classic hooks names the session on the board, a
 
   await $.classic.UserPromptSubmit({ prompt: 'carry on', session_title: 'Storied remote' })
   expect(world.boardFile('sess-A')?.title).toBe('Storied remote')
+
+  // Resuming another session rebinds first, so its title lands in its own file and this one keeps its own.
+  world.setSessionId('sess-B')
+  await $.classic.SessionStart({ source: 'resume', session_title: 'Concairge' })
+  expect(world.boardFile('sess-A')?.title).toBe('Storied remote')
+  expect(world.boardFile('sess-B')?.title).toBe('Concairge')
 })
 
 test('a turn that does a loose end ticks it off, and the pane hides done items until asked', async ($, on) => {
