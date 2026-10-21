@@ -31,6 +31,8 @@ export type Checklist = {
 export type BoardSession = {
   sessionId: string
   project: string
+  /** The session's own title, as the Desktop app's session list shows it, when it has one. */
+  title?: string
   cwd: string
   /** One sentence on what the session is handling right now. */
   summary: string
@@ -53,6 +55,8 @@ declare module 'claude-code' {
       checklist: Checklist
       summary: string
       board: BoardSession[]
+      /** Whether the pane lists completed items as well as open ones. */
+      showDone: boolean
     }
   }
 }

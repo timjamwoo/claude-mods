@@ -57,7 +57,7 @@ export function parse(text: string): BoardSession | undefined {
 /** As `parse`, for a value already decoded from JSON. */
 export function parseValue(raw: unknown): BoardSession | undefined {
   if (!isRecord(raw)) return undefined
-  const { sessionId, project, cwd, summary, items, updatedAt, endedAt, machine, tty, url } = raw
+  const { sessionId, project, title, cwd, summary, items, updatedAt, endedAt, machine, tty, url } = raw
   if (typeof sessionId !== 'string' || sessionId === '') return undefined
   if (typeof project !== 'string' || typeof cwd !== 'string') return undefined
   if (typeof updatedAt !== 'string' || Number.isNaN(Date.parse(updatedAt))) return undefined
@@ -70,6 +70,7 @@ export function parseValue(raw: unknown): BoardSession | undefined {
     items: Array.isArray(items) ? items.map(parseItem).filter((item): item is ChecklistItem => item !== undefined) : [],
     updatedAt,
   }
+  if (typeof title === 'string' && title.trim() !== '') session.title = title.trim()
   if (typeof endedAt === 'string') session.endedAt = endedAt
   if (typeof machine === 'string' && machine !== '') session.machine = machine
   if (typeof tty === 'string' && tty.startsWith('/dev/')) session.tty = tty
@@ -139,9 +140,14 @@ function age(session: BoardSession, nowMs: number): string {
   return `${Math.round(hours / 24)}d`
 }
 
+/** What a session is called on the board: its title when it has one, else its project. */
+export function displayName(session: Pick<BoardSession, 'project' | 'title'>): string {
+  return session.title ?? session.project
+}
+
 /**
- * One band line: a marker, the project, the summary and the open count. A
- * session on another machine than `homeMachine` is tagged with its machine.
+ * One board line: a marker, the session's name, the summary and the open
+ * count. A session on another machine than `homeMachine` is tagged with its machine.
  */
 export function boardLine(session: BoardSession, isCurrent: boolean, nowMs: number, homeMachine?: string): string {
   const open = openItems(session.items).length
@@ -149,7 +155,7 @@ export function boardLine(session: BoardSession, isCurrent: boolean, nowMs: numb
   const summary = session.summary === '' ? '—' : session.summary
   const where = session.machine !== undefined && session.machine !== homeMachine ? ` · @${session.machine}` : ''
   const stale = isStale(session, nowMs) ? ` · stale ${age(session, nowMs)}` : ''
-  return `${marker} ${session.project} · ${summary} · ${open} open${where}${stale}`
+  return `${marker} ${displayName(session)} · ${summary} · ${open} open${where}${stale}`
 }
 
 /** Current session first, then the rest by most recent update. */

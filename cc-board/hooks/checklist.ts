@@ -15,6 +15,7 @@ export type Change =
   | { kind: 'manual-added'; item: ChecklistItem }
   | { kind: 'followup-added'; item: ChecklistItem }
   | { kind: 'kept-done'; item: ChecklistItem }
+  | { kind: 'auto-done'; item: ChecklistItem }
 
 export const EMPTY_CHECKLIST: Checklist = { items: [], nextId: 1 }
 
@@ -34,9 +35,12 @@ export function applyTaskEvent(list: Checklist, event: TaskEvent): { list: Check
     const known = list.items.find(item => item.taskId === event.taskId)
     if (known !== undefined) return { list, item: known }
     const sameText = list.items.find(item => item.source === 'todo' && item.taskId === undefined && item.text === subject)
-    if (sameText !== undefined) {
-      const item = { ...sameText, taskId: event.taskId }
-      return { list: { ...list, items: list.items.map(one => (one === sameText ? item : one)) }, item }
+    // A task Claude takes on that reads like an open manual step or loose end adopts that item: when
+    // the task completes, the item does too.
+    const adopted = sameText ?? list.items.find(item => item.source !== 'todo' && item.taskId === undefined && item.status !== 'completed' && isSimilar(item.text, subject))
+    if (adopted !== undefined) {
+      const item = { ...adopted, taskId: event.taskId }
+      return { list: { ...list, items: list.items.map(one => (one === adopted ? item : one)) }, item }
     }
     const item: ChecklistItem = { id: list.nextId, text: subject, source: 'todo', status: 'pending', ticked: false, taskId: event.taskId }
     return { list: { items: [...list.items, item], nextId: list.nextId + 1 }, item }
@@ -44,7 +48,12 @@ export function applyTaskEvent(list: Checklist, event: TaskEvent): { list: Check
 
   const found = list.items.find(item => item.taskId === event.taskId)
   if (found === undefined) return { list }
-  if (event.status === 'deleted') return { list: { ...list, items: list.items.filter(item => item !== found) }, item: found }
+  if (event.status === 'deleted') {
+    // A deleted task takes its own item with it; an adopted manual step or loose end only loses the link.
+    if (found.source === 'todo') return { list: { ...list, items: list.items.filter(item => item !== found) }, item: found }
+    const { taskId: _dropped, ...detached } = found
+    return { list: { ...list, items: list.items.map(item => (item === found ? detached : item)) }, item: detached }
+  }
 
   let item: ChecklistItem = { ...found }
   if (event.subject !== undefined && event.subject.trim() !== '') item.text = event.subject.trim()
@@ -116,6 +125,69 @@ function addItem(list: Checklist, text: string, source: 'manual' | 'followup'): 
 
   const item: ChecklistItem = { id: list.nextId, text: trimmed, source, status: 'pending', ticked: false }
   return { list: { items: [...list.items, item], nextId: list.nextId + 1 }, item, added: true }
+}
+
+const STOP_WORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'that', 'this', 'then', 'than', 'into', 'onto', 'your', 'their', 'once', 'when',
+  'after', 'before', 'later', 'also', 'make', 'sure', 'need', 'needs', 'have', 'will', 'should', 'still', 'done', 'again',
+])
+
+/** The words of `text` worth matching on: four letters or more, lower case, no stop words, no repeats. */
+export function keywords(text: string): string[] {
+  const found = new Set<string>()
+  for (const word of normalizeText(text).split(' ')) {
+    if (word.length >= 4 && !STOP_WORDS.has(word)) found.add(word)
+  }
+  return [...found]
+}
+
+/**
+ * True when one text says the same as the other with extra words: every keyword
+ * of the shorter is in the longer, and there are at least two. A differing
+ * word on either side ("staging" against "production") keeps them apart.
+ */
+export function isSimilar(a: string, b: string): boolean {
+  const left = keywords(a)
+  const right = keywords(b)
+  const [shorter, longer] = left.length <= right.length ? [left, new Set(right)] : [right, new Set(left)]
+  return shorter.length >= 2 && shorter.every(word => longer.has(word))
+}
+
+/**
+ * The open manual steps and loose ends that `text` might have handled: those
+ * sharing at least two keywords with it. The cheap gate before asking Haiku.
+ */
+export function candidatesHandled(items: readonly ChecklistItem[], text: string): ChecklistItem[] {
+  const words = new Set(keywords(text))
+  return items.filter(item => {
+    if (item.source === 'todo' || item.status === 'completed') return false
+    return keywords(item.text).filter(word => words.has(word)).length >= 2
+  })
+}
+
+/** The ids a "which items were handled" reply names, limited to the candidates it was asked about. */
+export function parseHandledIds(reply: string, candidates: readonly ChecklistItem[]): number[] {
+  const allowed = new Set(candidates.map(item => item.id))
+  const ids: number[] = []
+  for (const line of reply.split('\n')) {
+    const match = /^\s*(?:[-*]\s*)?#?(\d+)\b/.exec(line)
+    if (match === null) continue
+    const id = Number(match[1])
+    if (allowed.has(id) && !ids.includes(id)) ids.push(id)
+  }
+  return ids
+}
+
+/** Marks the named items completed because the work was seen done, leaving the person's own ticks alone. */
+export function markHandled(list: Checklist, ids: readonly number[]): { list: Checklist; items: ChecklistItem[] } {
+  const done: ChecklistItem[] = []
+  const items = list.items.map(item => {
+    if (!ids.includes(item.id) || item.status === 'completed') return item
+    const handled: ChecklistItem = { ...item, status: 'completed' }
+    done.push(handled)
+    return handled
+  })
+  return { list: { ...list, items }, items: done }
 }
 
 const LOOSE_END_CUE =
@@ -216,9 +288,11 @@ export function describeChanges(changes: readonly Change[]): string {
   const manual = of('manual-added')
   const followUps = of('followup-added')
   const kept = of('kept-done')
+  const auto = of('auto-done')
 
   const parts: string[] = []
   if (ticked.length > 0) parts.push(`The user ticked these done: ${quote(ticked)}.`)
+  if (auto.length > 0) parts.push(`Marked done because this exchange handled them: ${quote(auto)}.`)
   if (kept.length > 0) {
     parts.push(`These stay done because the user ticked them, although your TodoWrite reopened them: ${quote(kept)}.`)
   }
@@ -227,7 +301,7 @@ export function describeChanges(changes: readonly Change[]): string {
   if (followUps.length > 0) {
     parts.push(`Loose ends noted on the user's checklist so they are not forgotten (no action from you unless asked): ${quote(followUps)}.`)
   }
-  if (ticked.length > 0 || kept.length > 0) {
+  if (ticked.length > 0 || kept.length > 0 || auto.length > 0) {
     parts.push('Do not remind the user about done items or add them back to TodoWrite.')
   }
   return `[cc-board] Checklist update. ${parts.join(' ')}`
@@ -261,17 +335,19 @@ function updateFailed(result: unknown): boolean {
 export function reconcile(saved: Checklist, replayed: Checklist): Checklist {
   let list = saved
   for (const item of replayed.items) {
-    if (item.source === 'manual' || item.source === 'followup') {
-      list = addItem(list, item.text, item.source).list
-      continue
-    }
-    const known = list.items.find(one => (item.taskId !== undefined && one.taskId === item.taskId) || (one.source === 'todo' && one.text === item.text))
+    const key = normalizeText(item.text)
+    const known =
+      (item.taskId !== undefined ? list.items.find(one => one.taskId === item.taskId) : undefined) ??
+      list.items.find(one => (item.source === 'todo' ? one.source === 'todo' && one.text === item.text : normalizeText(one.text) === key))
     if (known === undefined) {
       list = { items: [...list.items, { ...item, id: list.nextId }], nextId: list.nextId + 1 }
-    } else if (known.taskId === undefined && item.taskId !== undefined) {
-      const linked = { ...known, taskId: item.taskId }
-      list = { ...list, items: list.items.map(one => (one === known ? linked : one)) }
+      continue
     }
+    let updated = known
+    if (updated.taskId === undefined && item.taskId !== undefined) updated = { ...updated, taskId: item.taskId }
+    // A task the transcript shows finished finishes the item it adopted, whatever the file said.
+    if (item.taskId !== undefined && item.status === 'completed' && updated.status !== 'completed') updated = { ...updated, status: 'completed' }
+    if (updated !== known) list = { ...list, items: list.items.map(one => (one === known ? updated : one)) }
   }
   return list
 }
@@ -291,7 +367,6 @@ function createdTaskId(result: unknown): string | undefined {
  */
 export function seedFromTranscript(messages: readonly TranscriptMessage[]): Checklist {
   let list = EMPTY_CHECKLIST
-  const manualLines: string[] = []
 
   for (const message of messages) {
     if (message.role !== 'assistant') continue
@@ -314,11 +389,8 @@ export function seedFromTranscript(messages: readonly TranscriptMessage[]): Chec
         list = applyTaskEvent(list, event).list
       }
     }
-    for (const line of parseManualLines(message.text)) {
-      if (!manualLines.includes(line)) manualLines.push(line)
-    }
+    // Message by message, so a MANUAL: step written before Claude takes it on as a task is adopted by that task.
+    for (const line of parseManualLines(message.text)) list = addManual(list, line).list
   }
-
-  for (const line of manualLines) list = addManual(list, line).list
   return list
 }
