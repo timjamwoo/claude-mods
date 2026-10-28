@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { BoardSession } from '../types'
-import { basename, boardLine, cheapSummary, cleanPrompt, displayName, fullBoardText, isLive, isStale, parse, serialize } from '../hooks/board'
+import { basename, boardLine, cheapSummary, cleanPrompt, displayName, fullBoardText, isLive, isStale, parse, serialize, sessionDetail, sessionHeading } from '../hooks/board'
 
 const NOW = Date.parse('2026-10-20T12:00:00Z')
 
@@ -67,6 +67,16 @@ describe('summary and lines', () => {
     expect(boardLine({ ...session, summary: '' }, false, NOW)).toBe('  my-app · — · 1 open')
     const old = { ...session, updatedAt: '2026-10-17T11:30:00Z' }
     expect(boardLine(old, false, NOW)).toBe('  my-app · Fixing the login crash · 1 open · stale 3d')
+  })
+
+  test('the pane names a session on one line and says what it is doing on the next', async () => {
+    expect(sessionHeading(session, true, NOW)).toBe('▶ my-app')
+    expect(sessionDetail(session)).toBe('Fixing the login crash · 1 open')
+    const titled = { ...session, title: 'Main Storied Thread (Local)', machine: 'cloud' }
+    expect(sessionHeading(titled, false, NOW, 'mbp')).toBe('  Main Storied Thread (Local) · my-app · @cloud')
+    expect(sessionHeading({ ...titled, endedAt: '2026-10-20T11:40:00Z' }, false, NOW, 'cloud')).toBe('  Main Storied Thread (Local) · my-app · ended')
+    expect(sessionHeading({ ...session, updatedAt: '2026-10-17T11:30:00Z' }, false, NOW)).toBe('  my-app · stale 3d')
+    expect(sessionDetail({ ...session, summary: '', items: [] })).toBe('— · 0 open')
   })
 
   test('a session with a title is listed by it, and the title survives the file round trip', async () => {

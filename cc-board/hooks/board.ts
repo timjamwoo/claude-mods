@@ -146,6 +146,24 @@ export function displayName(session: Pick<BoardSession, 'project' | 'title'>): s
 }
 
 /**
+ * The first of a session's two pane lines: a marker, the title, the repo, and
+ * where it runs when that is another machine, then "ended" or how stale it is.
+ */
+export function sessionHeading(session: BoardSession, isCurrent: boolean, nowMs: number, homeMachine?: string): string {
+  const marker = isCurrent ? '▶' : ' '
+  const name = session.title === undefined ? session.project : `${session.title} · ${session.project}`
+  const where = session.machine !== undefined && session.machine !== homeMachine ? ` · @${session.machine}` : ''
+  const state = session.endedAt !== undefined ? ' · ended' : isStale(session, nowMs) ? ` · stale ${age(session, nowMs)}` : ''
+  return `${marker} ${name}${where}${state}`
+}
+
+/** The second pane line: what the session is doing, and how much is open. */
+export function sessionDetail(session: BoardSession): string {
+  const summary = session.summary === '' ? '—' : session.summary
+  return `${summary} · ${openItems(session.items).length} open`
+}
+
+/**
  * One board line: a marker, the session's name, the summary and the open
  * count. A session on another machine than `homeMachine` is tagged with its machine.
  */

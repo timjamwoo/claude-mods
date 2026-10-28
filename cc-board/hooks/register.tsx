@@ -28,6 +28,7 @@ import {
   openItems,
   parseHandledIds,
   parseItemId,
+  parseReviewLines,
   parseFollowUpLines,
   parseManualLines,
   reconcile,
@@ -51,6 +52,8 @@ import {
   mergeSessions,
   parse,
   serialize,
+  sessionDetail,
+  sessionHeading,
   sortSessions,
   sourceTag,
   STALE_AFTER_MS,
@@ -63,6 +66,10 @@ const REMOTE_POLL_MS = 15000
 const REMOTE_PUSH_MS = 2000
 const FLUSH_MS = 300
 const HAIKU_GAP_MS = 5 * 60 * 1000
+// A review of every open item against the recent conversation, every so many answered turns.
+const REVIEW_EVERY_TURNS = 6
+const REVIEW_MESSAGES = 24
+const REVIEW_MAX_ITEMS = 60
 
 const checklist = atom({ plugin: 'cc-board', key: 'checklist' } as const, EMPTY_CHECKLIST)
 const summary = atom({ plugin: 'cc-board', key: 'summary' } as const, '')
@@ -104,6 +111,8 @@ let lastAnswer = ''
 let haikuText = ''
 let haikuPrompt = ''
 let haikuAt = 0
+// Answered turns since the last review of the open items.
+let turnsSinceReview = 0
 
 // Changes not yet told to Claude, flushed as one note after a short pause.
 let pending: Change[] = []
@@ -555,7 +564,7 @@ async function extractFollowUps($: EngineInterface, text: string): Promise<strin
     const reply = await $.model.complete({
       model: 'haiku',
       system:
-        'You keep a checklist for a developer so small things said in passing are not forgotten. Read the exchange and list only concrete actions a person still has to do: something to do by hand or outside this conversation (a portal, a key, a certificate, a store listing, a release, a config), something deferred or skipped for now, or something asked for and not done. Skip what the assistant says it will do next, skip advice and hypotheticals, skip anything finished, and skip anything already on the checklist. One per line, imperative, at most twelve words, at most three lines, no numbering, no commentary. If there is nothing, reply NONE.',
+        'You keep a short checklist for a developer so things said in passing are not forgotten. Read the exchange and list only what a person still has to do themselves, outside this conversation (a portal, a key, a certificate, a store listing, a merge, a config), or what was explicitly deferred. Skip what the assistant will do next, advice, hypotheticals, anything finished, and anything already on the checklist. Fold related steps into one. One per line, imperative, at most eight words, at most two lines, no numbering, no commentary. If there is nothing, reply NONE.',
       prompt: `Already on the checklist:\n${open === '' ? '(nothing)' : open}\n\nExchange:\n${cueExcerpts(text)}`,
       maxTokens: 160,
       effort: 'low',
@@ -573,7 +582,7 @@ async function extractFollowUps($: EngineInterface, text: string): Promise<strin
 }
 
 const SCAN_CHUNK_MESSAGES = 16
-const SCAN_MAX_CALLS = 8
+const SCAN_MAX_CALLS = 4
 
 /**
  * Reads a whole conversation for loose ends, newest first, in chunks of
@@ -593,6 +602,62 @@ async function scanTranscript($: EngineInterface, messages: readonly { role: 'us
   }
   if (found > 0) await writeBoardFile($)
   return found
+}
+
+/**
+ * Reviews every open manual step and loose end against the recent
+ * conversation: what it shows done is ticked, what it shows no longer relevant
+ * is dropped. One Haiku call; nothing happens when the list is empty.
+ * Resolves how many items were closed.
+ */
+async function reviewOpenItems($: EngineInterface): Promise<number> {
+  if (!useAutoDone) return 0
+  const list = await read($, checklist)
+  const candidates = list.items.filter(item => item.source !== 'todo' && item.status !== 'completed').slice(0, REVIEW_MAX_ITEMS)
+  if (candidates.length === 0) return 0
+  let verdicts = { done: [] as number[], dropped: [] as number[] }
+  try {
+    const messages = await $.session.messages()
+    if ('deny' in messages) return 0
+    const recent = messages
+      .slice(-REVIEW_MESSAGES)
+      .map(message => `${message.role === 'user' ? 'User' : 'Claude'}: ${clip(cleanPrompt(message.text), 1200)}`)
+      .filter(line => !/^(User|Claude): $/.test(line))
+      .join('\n\n')
+    if (recent === '') return 0
+    const reply = await $.model.complete({
+      model: 'haiku',
+      system:
+        'You keep a checklist for a developer. For each item, read the recent conversation and answer: done when the work is shown finished, by the assistant or by the user; obsolete when the conversation has moved on so the item no longer applies (superseded, reverted, decided against); open otherwise. When unsure, answer open. One line per item, in the form "#<number> done", "#<number> obsolete" or "#<number> open". No commentary.',
+      prompt: `Checklist:\n${candidates.map(item => `#${item.id} ${item.text}`).join('\n')}\n\nRecent conversation:\n${recent}`,
+      maxTokens: 400,
+      effort: 'low',
+      timeoutMs: 12000,
+    })
+    if (!reply.isAnswered) {
+      log($, `review skipped: ${reply.reason}`)
+      return 0
+    }
+    verdicts = parseReviewLines(reply.text, candidates)
+  } catch (error) {
+    log($, `review failed: ${String(error)}`)
+    return 0
+  }
+  turnsSinceReview = 0
+  const closing = [...verdicts.done, ...verdicts.dropped]
+  if (closing.length === 0) return 0
+  let closed: ChecklistItem[] = []
+  await update($, checklist, (list: Checklist) => {
+    const result = markHandled(list, closing)
+    closed = result.items
+    return result.list
+  })
+  for (const item of closed) queueChange($, { kind: verdicts.done.includes(item.id) ? 'auto-done' : 'dropped', item })
+  const ticked = closed.filter(item => verdicts.done.includes(item.id)).length
+  const dropped = closed.length - ticked
+  $.ui.toast(`review: ${ticked} done, ${dropped} dropped`)
+  await writeBoardFile($)
+  return closed.length
 }
 
 /**
@@ -692,6 +757,8 @@ async function restoreChecklist($: EngineInterface): Promise<'file' | 'transcrip
           await update($, checklist, () => list)
           await update($, summary, () => saved.summary)
           if (lastPrompt === '') lastPrompt = replayed.lastPrompt
+          // A list that sat through turns this mod did not see is reviewed against the transcript now.
+          await reviewOpenItems($)
           return 'file'
         }
       }
@@ -815,11 +882,15 @@ async function noteTitle($: EngineInterface, fresh: string | undefined): Promise
   await writeBoardFile($)
 }
 
-/** The sessions the pane and the band list: every one not ended, this one first. */
+/**
+ * The sessions the pane and the band list, this one first: every session
+ * updated within the stale window, ended ones included, since a cloud session
+ * whose container was reclaimed is still a thread the person may go back to.
+ */
 async function liveSessions($: EngineInterface): Promise<{ rows: BoardSession[]; now: number }> {
   const all = await read($, board)
   const now = await $.clock.now()
-  return { rows: sortSessions(all, sessionId).filter(session => session.endedAt === undefined), now }
+  return { rows: sortSessions(all, sessionId).filter(session => !isStale(session, now)), now }
 }
 
 export const register: Register = (on, options) => {
@@ -978,6 +1049,8 @@ export const register: Register = (on, options) => {
         const exchange = `User: ${clip(lastPrompt, 2000)}\n\nClaude: ${e.answer}`
         await tickHandled($, exchange)
         await surfaceFollowUps($, exchange)
+        turnsSinceReview += 1
+        if (turnsSinceReview >= REVIEW_EVERY_TURNS) await reviewOpenItems($)
       }
       await writeBoardFile($)
     }
@@ -1022,9 +1095,10 @@ export const register: Register = (on, options) => {
       try {
         const messages = await $.session.messages()
         if ('deny' in messages) return { text: 'cc-board: the transcript could not be read.' }
+        const closed = await reviewOpenItems($)
         const found = await scanTranscript($, messages)
         void $.ui.open({ id: PANE, title: 'cc-board' })
-        return { text: found === 0 ? 'cc-board: no new loose ends in this chat.' : `cc-board: ${found} loose end(s) added from this chat.` }
+        return { text: `cc-board: ${closed} item(s) closed, ${found} loose end(s) added from this chat.` }
       } catch (error) {
         return { text: `cc-board: scan failed: ${String(error)}` }
       }
@@ -1050,13 +1124,19 @@ export const register: Register = (on, options) => {
     return (
       <Box flexDirection="column">
         {rows.map(session => (
-          <Button
-            key={`session-${session.sessionId}`}
-            plain
-            dimColor={isStale(session, now)}
-            label={boardLine(session, session.sessionId === sessionId, now, machine)}
-            onPress={press => void switchToSession($, session, press.surface)}
-          />
+          <Box key={`row-${session.sessionId}`} flexDirection="column">
+            <Button
+              key={`session-${session.sessionId}`}
+              plain
+              dimColor={session.endedAt !== undefined}
+              label={sessionHeading(session, session.sessionId === sessionId, now, machine)}
+              onPress={press => void switchToSession($, session, press.surface)}
+            />
+            <Text dimColor wrap="truncate-end">
+              {'   '}
+              {sessionDetail(session)}
+            </Text>
+          </Box>
         ))}
         {rows.length > 0 && <Text> </Text>}
         <Text bold>

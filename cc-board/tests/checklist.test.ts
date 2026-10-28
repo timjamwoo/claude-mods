@@ -17,6 +17,7 @@ import {
   parseFollowUpLines,
   parseHandledIds,
   parseItemId,
+  parseReviewLines,
   parseManualLines,
   reconcile,
   seedFromTranscript,
@@ -251,7 +252,10 @@ describe('handled items', () => {
   ]
 
   test('keywords and isSimilar ignore short and stop words', async () => {
-    expect(keywords('Renew the push certificate, then make sure it is done')).toEqual(['renew', 'push', 'certificate'])
+    expect(keywords('Renew the push certificate, then make sure it is done')).toEqual(['renew', 'push', 'certificat'])
+    // Stems, so a finished tense still matches the item it finished, and a PR number counts as a word.
+    expect(keywords('Merged PR #2309 and rotated the keys')).toEqual(['merg', '2309', 'rotat', 'key'])
+    expect(isSimilar('Merge PR #2309 to production', 'Merged #2309 into production')).toBe(true)
     expect(isSimilar('Renew the push certificate in the portal', 'Renew push certificate')).toBe(true)
     expect(isSimilar('Renew the push certificate', 'Fix the login crash')).toBe(false)
     expect(isSimilar('Bump the version', 'Bump the build number before release')).toBe(false)
@@ -277,9 +281,19 @@ describe('handled items', () => {
     expect(result.items.map(item => item.id)).toEqual([1])
     expect(result.list.items[0]).toEqual({ ...items[0], status: 'completed' })
     const note = describeChanges([{ kind: 'auto-done', item: result.items[0]! }])
-    expect(note).toContain('handled them')
+    expect(note).toContain('shows them handled')
     expect(note).toContain('#1 "Rotate the API key in the portal"')
     expect(note).toContain('Do not remind')
+    const dropped = describeChanges([{ kind: 'dropped', item: result.items[0]! }])
+    expect(dropped).toContain('Dropped as no longer relevant')
+    expect(dropped).toContain('Do not remind')
+  })
+
+  test('parseReviewLines reads one verdict per item and ignores the rest', async () => {
+    const candidates = items.slice(0, 2)
+    expect(parseReviewLines('#1 done\n#2: obsolete\n#3 done', candidates)).toEqual({ done: [1], dropped: [2] })
+    expect(parseReviewLines('- 1 open\n2 done\n2 obsolete', candidates)).toEqual({ done: [2], dropped: [] })
+    expect(parseReviewLines('All of them look done.', candidates)).toEqual({ done: [], dropped: [] })
   })
 })
 
@@ -308,9 +322,19 @@ describe('loose ends', () => {
     expect(parseFollowUpLines('- Rotate the API key in the portal\n2. Bump the version\n• rotate the api key in the portal!\n\nSubmit the build')).toEqual([
       'Rotate the API key in the portal',
       'Bump the version',
-      'Submit the build',
     ])
-    expect(parseFollowUpLines('a\nb\nc\nd\ne\nf\ng').length).toBe(3)
+    expect(parseFollowUpLines('a\nb\nc\nd\ne\nf\ng').length).toBe(2)
+    // Prose, a heading and anything too long to read at a glance are not items.
+    expect(parseFollowUpLines('Here is what remains from the exchange, excluding what is done:\nThe rest looks fine\nRemaining steps:\nMerge PR #2309 to apply the 22 production migrations once the preview run has been checked by hand\nMerge PR #2309')).toEqual(['Merge PR #2309'])
+  })
+
+  test('addFollowUp drops a near twin of an item already listed', async () => {
+    const first = addFollowUp(EMPTY_CHECKLIST, 'Add a postal address to the two upgrade emails')
+    const twin = addFollowUp(first.list, 'Add a postal address to both upgrade emails')
+    expect(twin.added).toBe(false)
+    expect(twin.list.items.length).toBe(1)
+    const other = addFollowUp(first.list, 'Add a postal address to the Halloween broadcast')
+    expect(other.added).toBe(true)
   })
 
   test('addFollowUp dedupes against any item by normalized text', async () => {

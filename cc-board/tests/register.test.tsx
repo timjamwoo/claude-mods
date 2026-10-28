@@ -260,6 +260,7 @@ test('the pane lists every live session, marks this one and dims stale ones; the
   }
   world.put(`${BOARD_DIR}/sess-B.json`, JSON.stringify(other))
   world.put(`${BOARD_DIR}/sess-C.json`, JSON.stringify({ ...other, sessionId: 'sess-C', project: 'old-repo', updatedAt: '2026-10-10T11:55:00Z' }))
+  world.put(`${BOARD_DIR}/sess-D.json`, JSON.stringify({ ...other, sessionId: 'sess-D', project: 'done-repo', endedAt: '2026-10-20T11:56:00Z' }))
   world.put(`${BOARD_DIR}/broken.json`, '{ this is not json')
 
   // The next poll picks the files up.
@@ -268,13 +269,17 @@ test('the pane lists every live session, marks this one and dims stale ones; the
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     const mine = await ui.find({ type: 'Button', text: /my-app/ })
-    expect(mine?.text).toBe('▶ my-app · — · 0 open')
+    expect(mine?.text).toBe('▶ my-app')
     expect(mine?.key).toBe('session-sess-A')
+    expect(await ui.find({ type: 'Text', text: /^\s*— · 0 open$/ })).toBeDefined()
     const theirs = await ui.find({ type: 'Button', text: /other-repo/ })
-    expect(theirs?.text).toBe('  other-repo · Adding the settings page · 1 open')
-    const stale = await ui.find({ type: 'Button', text: /old-repo/ })
-    expect(stale?.props.dimColor).toBe(true)
-    expect(stale?.text).toContain('stale')
+    expect(theirs?.text).toBe('  other-repo')
+    expect(await ui.find({ type: 'Text', text: /Adding the settings page · 1 open/ })).toBeDefined()
+    // A session that ended stays, dimmed, while it is fresh; a stale one is left off the pane.
+    const ended = await ui.find({ type: 'Button', text: /done-repo/ })
+    expect(ended?.text).toBe('  done-repo · ended')
+    expect(ended?.props.dimColor).toBe(true)
+    expect(await ui.find({ type: 'Button', text: /old-repo/ })).toBeUndefined()
     await ui.unmount()
   }
 
@@ -469,8 +474,9 @@ test('sessions from the shared board join the pane, and prune deletes from both 
   await world.clock.advance(15000)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect((await ui.find({ type: 'Button', text: /other-repo/ }))?.text).toBe('  other-repo · Adding the settings page · 1 open · @cloud')
-  expect((await ui.find({ type: 'Button', text: /old-repo/ }))?.props.dimColor).toBe(true)
+  expect((await ui.find({ type: 'Button', text: /other-repo/ }))?.text).toBe('  other-repo · @cloud')
+  expect(await ui.find({ type: 'Text', text: /Adding the settings page · 1 open/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: /old-repo/ })).toBeUndefined()
   await ui.unmount()
 
   // The capped read holds 500 rows, so some stale rows were never seen; prune still removes them by time.
@@ -694,7 +700,7 @@ test('the session title from the classic hooks names the session on the board, a
   await world.clock.advance(2000)
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Button', text: /Main Storied/ }))?.text).toBe('▶ Main Storied Thread (Local) · — · 0 open')
+    expect((await ui.find({ type: 'Button', text: /Main Storied/ }))?.text).toBe('▶ Main Storied Thread (Local) · my-app')
     expect(await ui.find({ type: 'Text', text: /^Main Storied Thread \(Local\) · 0 open$/ })).toBeDefined()
     await ui.unmount()
   }
@@ -744,7 +750,7 @@ test('a turn that does a loose end ticks it off, and the pane hides done items u
     [2, 'pending', false],
   ])
   await world.clock.advance(300)
-  expect(world.lastNote()).toContain('handled them')
+  expect(world.lastNote()).toContain('shows them handled')
   expect(world.lastNote()).toContain('#1 "Rotate the API key in the portal"')
 
   // The pane shows open items only, with a toggle that reveals the done ones.
@@ -768,6 +774,51 @@ test('a turn that does a loose end ticks it off, and the pane hides done items u
   await ui.unmount()
 })
 
+test('every few turns the open items are reviewed against the conversation: done ones tick, stale ones drop', async ($, on) => {
+  const transcript: SessionMessage[] = []
+  const world = fakeWorld(on, transcript)
+  const asked: string[] = []
+  on('model.complete', (_, e) => {
+    asked.push(e.prompt)
+    const text = e.prompt.startsWith('Checklist:') && e.prompt.includes('Recent conversation:') ? '#1 done\n#2 obsolete\n#3 open' : e.prompt.startsWith('Already on the checklist') ? 'NONE' : 'Working'
+    return { value: { isAnswered: true, text, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
+  })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  for (const step of ['Merge PR #2309 to production', 'Add a postal address to the upgrade email', 'Run the reader import']) {
+    await $.command.run({ command: 'manual', args: step, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  }
+  await world.clock.advance(300)
+
+  const isReview = (prompt: string) => prompt.includes('Recent conversation:')
+  for (let i = 1; i <= 6; i += 1) {
+    transcript.push({ role: 'user', text: `step ${i}`, toolUses: [] }, { role: 'assistant', text: `did step ${i}`, toolUses: [] })
+    await $.prompt.submit({ text: `step ${i}`, origin: { kind: 'composer' }, wait: false })
+    await $.turn.start({ text: `step ${i}`, turnId: `t${i}` })
+    await $.turn.complete({ turnId: `t${i}`, answer: `did step ${i}`, durationMs: 10, isAborted: false, reason: 'answer' })
+    expect(asked.filter(isReview).length).toBe(i < 6 ? 0 : 1)
+  }
+  const review = asked.find(isReview) ?? ''
+  expect(review).toContain('#1 Merge PR #2309 to production')
+  expect(review).toContain('did step 6')
+  expect(world.boardFile('sess-A')?.items.map(item => [item.id, item.status])).toEqual([
+    [1, 'completed'],
+    [2, 'completed'],
+    [3, 'pending'],
+  ])
+  expect(world.toasts.at(-1)).toBe('review: 1 done, 1 dropped')
+  await world.clock.advance(300)
+  expect(world.lastNote()).toContain('shows them handled: #1')
+  expect(world.lastNote()).toContain('Dropped as no longer relevant: #2')
+
+  // /board scan reviews too, and says what it closed.
+  const scan = await $.command.run({ command: 'board', args: 'scan', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(asked.filter(isReview).length).toBe(2)
+  expect(scan?.text).toBe('cc-board: 0 item(s) closed, 0 loose end(s) added from this chat.')
+})
+
 test('a long-running chat is scanned for loose ends from its whole history, and /board scan repeats it', async ($, on) => {
   const transcript: SessionMessage[] = []
   for (let i = 0; i < 40; i += 1) {
@@ -788,6 +839,6 @@ test('a long-running chat is scanned for loose ends from its whole history, and 
   expect(world.boardFile('sess-A')?.items.map(item => [item.text, item.source])).toEqual([['Renew the push certificate', 'followup']])
 
   const again = await $.command.run({ command: 'board', args: 'scan', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
-  expect(again?.text).toBe('cc-board: no new loose ends in this chat.')
+  expect(again?.text).toBe('cc-board: 0 item(s) closed, 0 loose end(s) added from this chat.')
   expect(world.boardFile('sess-A')?.items.length).toBe(1)
 })
