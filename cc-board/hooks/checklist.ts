@@ -16,6 +16,7 @@ export type Change =
   | { kind: 'followup-added'; item: ChecklistItem }
   | { kind: 'kept-done'; item: ChecklistItem }
   | { kind: 'auto-done'; item: ChecklistItem }
+  | { kind: 'dropped'; item: ChecklistItem }
 
 export const EMPTY_CHECKLIST: Checklist = { items: [], nextId: 1 }
 
@@ -120,7 +121,10 @@ export function normalizeText(text: string): string {
 function addItem(list: Checklist, text: string, source: 'manual' | 'followup'): { list: Checklist; item: ChecklistItem; added: boolean } {
   const trimmed = text.trim()
   const key = normalizeText(trimmed)
-  const existing = list.items.find(item => normalizeText(item.text) === key)
+  // The same text is never added twice; a near twin of an open item ("Add a postal address to the upgrade email" again) is not either.
+  const existing =
+    list.items.find(item => normalizeText(item.text) === key) ??
+    list.items.find(item => item.status !== 'completed' && isTwin(item.text, trimmed))
   if (existing !== undefined) return { list, item: existing, added: false }
 
   const item: ChecklistItem = { id: list.nextId, text: trimmed, source, status: 'pending', ticked: false }
@@ -130,15 +134,41 @@ function addItem(list: Checklist, text: string, source: 'manual' | 'followup'): 
 const STOP_WORDS = new Set([
   'the', 'and', 'for', 'with', 'from', 'that', 'this', 'then', 'than', 'into', 'onto', 'your', 'their', 'once', 'when',
   'after', 'before', 'later', 'also', 'make', 'sure', 'need', 'needs', 'have', 'will', 'should', 'still', 'done', 'again',
+  'are', 'but', 'all', 'any', 'can', 'has', 'had', 'was', 'our', 'its', 'out', 'now', 'get', 'got', 'per', 'via', 'off',
+  'one', 'two', 'both', 'each', 'them', 'they', 'you', 'not', 'yet', 'use',
 ])
 
-/** The words of `text` worth matching on: four letters or more, lower case, no stop words, no repeats. */
+/** A crude stem, so "merged", "merges" and "merging" all match "merge". */
+function stem(word: string): string {
+  let base = word
+  if (base.endsWith('ies') && base.length > 4) base = `${base.slice(0, -3)}y`
+  else if (base.endsWith('ing') && base.length > 5) base = base.slice(0, -3)
+  else if (base.endsWith('ed') && base.length > 4) base = base.slice(0, -2)
+  else if (base.endsWith('es') && base.length > 4) base = base.slice(0, -2)
+  else if (base.endsWith('s') && base.length > 3) base = base.slice(0, -1)
+  if (base.endsWith('e') && base.length > 3) base = base.slice(0, -1)
+  return base
+}
+
+/** The stems of the words of `text` worth matching on: three letters or more, no stop words, no repeats. */
 export function keywords(text: string): string[] {
   const found = new Set<string>()
   for (const word of normalizeText(text).split(' ')) {
-    if (word.length >= 4 && !STOP_WORDS.has(word)) found.add(word)
+    if (word.length >= 3 && !STOP_WORDS.has(word)) found.add(stem(word))
   }
   return [...found]
+}
+
+/**
+ * True when a new line restates an open item: the same first keyword (the
+ * verb, so "add" and "remove" stay apart) and every keyword of the shorter in
+ * the longer. Stricter than `isSimilar`, since a wrong twin loses an item.
+ */
+export function isTwin(a: string, b: string): boolean {
+  const left = keywords(a)
+  const right = keywords(b)
+  if (left.length < 2 || right.length < 2 || left[0] !== right[0]) return false
+  return isSimilar(a, b)
 }
 
 /**
@@ -176,6 +206,23 @@ export function parseHandledIds(reply: string, candidates: readonly ChecklistIte
     if (allowed.has(id) && !ids.includes(id)) ids.push(id)
   }
   return ids
+}
+
+/** The verdicts a review reply gives, one `#id done|obsolete|open` per line, limited to the items asked about. */
+export function parseReviewLines(reply: string, candidates: readonly ChecklistItem[]): { done: number[]; dropped: number[] } {
+  const allowed = new Set(candidates.map(item => item.id))
+  const done: number[] = []
+  const dropped: number[] = []
+  for (const line of reply.split('\n')) {
+    const match = /^\s*(?:[-*]\s*)?#?(\d+)\b[\s:.-]*(done|obsolete|open)\b/i.exec(line)
+    if (match === null) continue
+    const id = Number(match[1])
+    if (!allowed.has(id) || done.includes(id) || dropped.includes(id)) continue
+    const verdict = (match[2] ?? '').toLowerCase()
+    if (verdict === 'done') done.push(id)
+    else if (verdict === 'obsolete') dropped.push(id)
+  }
+  return { done, dropped }
 }
 
 /** Marks the named items completed because the work was seen done, leaving the person's own ticks alone. */
@@ -217,15 +264,17 @@ export function cueExcerpts(text: string, max = 6000, radius = 600): string {
   return joined.length <= max ? joined : joined.slice(joined.length - max)
 }
 
+const NOT_AN_ITEM = /^(here|the|there|this|that|it|i|we|you|note|none|nothing|no)\b|[:：]$/i
+
 /**
  * The loose ends a model listed, one per line: bullets and numbering
- * stripped, NONE and empty lines dropped, repeats and over-long lines removed.
+ * stripped; NONE, prose, repeats and anything too long to read at a glance dropped.
  */
-export function parseFollowUpLines(reply: string, max = 3): string[] {
+export function parseFollowUpLines(reply: string, max = 2): string[] {
   const lines: string[] = []
   for (const raw of reply.split('\n')) {
     const line = raw.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').trim()
-    if (line === '' || /^none\.?$/i.test(line) || line.length > 120) continue
+    if (line === '' || NOT_AN_ITEM.test(line) || line.length > 72 || line.split(/\s+/).length > 12) continue
     if (lines.some(one => normalizeText(one) === normalizeText(line))) continue
     lines.push(line)
     if (lines.length === max) break
@@ -289,10 +338,12 @@ export function describeChanges(changes: readonly Change[]): string {
   const followUps = of('followup-added')
   const kept = of('kept-done')
   const auto = of('auto-done')
+  const dropped = of('dropped')
 
   const parts: string[] = []
   if (ticked.length > 0) parts.push(`The user ticked these done: ${quote(ticked)}.`)
-  if (auto.length > 0) parts.push(`Marked done because this exchange handled them: ${quote(auto)}.`)
+  if (auto.length > 0) parts.push(`Marked done because the conversation shows them handled: ${quote(auto)}.`)
+  if (dropped.length > 0) parts.push(`Dropped as no longer relevant: ${quote(dropped)}.`)
   if (kept.length > 0) {
     parts.push(`These stay done because the user ticked them, although your TodoWrite reopened them: ${quote(kept)}.`)
   }
@@ -301,7 +352,7 @@ export function describeChanges(changes: readonly Change[]): string {
   if (followUps.length > 0) {
     parts.push(`Loose ends noted on the user's checklist so they are not forgotten (no action from you unless asked): ${quote(followUps)}.`)
   }
-  if (ticked.length > 0 || kept.length > 0 || auto.length > 0) {
+  if (ticked.length > 0 || kept.length > 0 || auto.length > 0 || dropped.length > 0) {
     parts.push('Do not remind the user about done items or add them back to TodoWrite.')
   }
   return `[cc-board] Checklist update. ${parts.join(' ')}`

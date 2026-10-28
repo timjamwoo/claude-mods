@@ -21,7 +21,12 @@ Task tools. A manual step or loose end is ticked when a later exchange
 shows the work done, by Claude or by you. Only items that share words with
 the exchange are put to Haiku, so most turns cost nothing. A task Claude
 takes on that reads like an open loose end adopts it, so the task finishing
-finishes the item. Turn the Haiku check off with the `autoDone` option.
+finishes the item. Every six answered turns, and whenever a session resumes
+with open items, the whole open list is reviewed against the recent
+conversation in one Haiku call: what it shows done is ticked, what it
+shows no longer relevant (superseded, reverted, decided against) is
+dropped, and Claude is told either way. Turn all of this off with the
+`autoDone` option.
 
 **Loose ends get surfaced.** The real point of the checklist is the small
 things said in passing and then forgotten: "you'll need to rotate the key
@@ -41,13 +46,15 @@ note says so, so Claude stops reminding you and does not add it back.
 
 **A live board of all sessions.** Each session writes
 `~/.claude/board/<session-id>.json` (atomically, temp file plus rename).
-Every session polls that folder every two seconds and draws one line per
-live session at the top of the pane: the session's title as the Desktop app
-lists it (its repo name until it has one), a one-sentence summary, open
-item count. The current session is marked with `▶`. Sessions with no update
-for 24 hours are dimmed as stale. Nothing here needs a Claude turn. The
-`band` option draws the same lines above the prompt as well, for a terminal
-too narrow to place the pane; it is off by default.
+Every session polls that folder every two seconds and draws two lines per
+session at the top of the pane: the session's title as the Desktop app
+lists it and its repo, then a one-sentence summary and the open count. The
+current session is marked with `▶`. A session that has ended stays, dimmed,
+until it has had no update for 24 hours, since a cloud session whose
+container was reclaimed is still a thread you may go back to; after that it
+leaves the pane. Nothing here needs a Claude turn. The `band` option draws
+one line per session above the prompt as well, for a terminal too narrow to
+place the pane; it is off by default.
 
 **Restarts, resumes and older sessions.** A session keeps its id across a
 restart or `claude --resume`, so at startup the mod reads its own board
@@ -66,10 +73,12 @@ click cannot reach any other way, such as one in the Desktop app on
 another Mac, gets its resume command copied to the clipboard instead, with
 a toast saying so.
 
-**`/board scan`** reads the whole conversation for loose ends, newest
-first, in chunks, with at most eight Haiku calls, which is what to run on a
-long chat that predates the mod or has things lingering from earlier. The
-same scan runs by itself the first time the mod meets a session.
+**`/board scan`** reviews the open items against the recent conversation,
+then reads the whole conversation for loose ends, newest first, in chunks,
+with at most four Haiku calls. It is what to run on a long chat that has
+things lingering from earlier. The same scan runs by itself the first time
+the mod meets a session. Loose ends are kept short, at most eight words and
+two per exchange, and a near twin of an item already listed is not added.
 
 **`/board`** prints the full board: every session, its open items, and the
 `claude --resume` command or the claude.ai page to get back to it. **`/board prune`** asks, then
@@ -213,8 +222,8 @@ It never answers or changes a tool call, and the only text it adds to a
 request is the checklist note. It makes four kinds of network call, each
 with its own switch: the Haiku summary (`haikuSummary`), the Haiku
 loose-end scan of an exchange that carries a cue phrase (`followUps`), the
-Haiku check of whether an exchange handled an open item (`autoDone`), all
-three through your own Claude Code credentials, and the table reads and
+Haiku check of whether an exchange or the recent conversation handled an
+open item (`autoDone`), all three through your own Claude Code credentials, and the table reads and
 writes once a shared board is configured (`boardUrl`). With all four off it
 touches nothing outside the machine. A missing board folder or a malformed board file is logged to
 the debug log (`claude --debug`) and skipped.
