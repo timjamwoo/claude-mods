@@ -121,8 +121,10 @@ export function normalizeText(text: string): string {
 function addItem(list: Checklist, text: string, source: 'manual' | 'followup'): { list: Checklist; item: ChecklistItem; added: boolean } {
   const trimmed = text.trim()
   const key = normalizeText(trimmed)
-  // The same text, or a near twin ("Add a postal address to the upgrade email" again), is not added twice.
-  const existing = list.items.find(item => normalizeText(item.text) === key) ?? list.items.find(item => isSimilar(item.text, trimmed))
+  // The same text is never added twice; a near twin of an open item ("Add a postal address to the upgrade email" again) is not either.
+  const existing =
+    list.items.find(item => normalizeText(item.text) === key) ??
+    list.items.find(item => item.status !== 'completed' && isTwin(item.text, trimmed))
   if (existing !== undefined) return { list, item: existing, added: false }
 
   const item: ChecklistItem = { id: list.nextId, text: trimmed, source, status: 'pending', ticked: false }
@@ -132,6 +134,8 @@ function addItem(list: Checklist, text: string, source: 'manual' | 'followup'): 
 const STOP_WORDS = new Set([
   'the', 'and', 'for', 'with', 'from', 'that', 'this', 'then', 'than', 'into', 'onto', 'your', 'their', 'once', 'when',
   'after', 'before', 'later', 'also', 'make', 'sure', 'need', 'needs', 'have', 'will', 'should', 'still', 'done', 'again',
+  'are', 'but', 'all', 'any', 'can', 'has', 'had', 'was', 'our', 'its', 'out', 'now', 'get', 'got', 'per', 'via', 'off',
+  'one', 'two', 'both', 'each', 'them', 'they', 'you', 'not', 'yet', 'use',
 ])
 
 /** A crude stem, so "merged", "merges" and "merging" all match "merge". */
@@ -146,14 +150,25 @@ function stem(word: string): string {
   return base
 }
 
-/** The stems of the words of `text` worth matching on: four letters or more (three for a number), no stop words, no repeats. */
+/** The stems of the words of `text` worth matching on: three letters or more, no stop words, no repeats. */
 export function keywords(text: string): string[] {
   const found = new Set<string>()
   for (const word of normalizeText(text).split(' ')) {
-    if (STOP_WORDS.has(word)) continue
-    if (word.length >= 4 || (word.length === 3 && /^\d+$/.test(word))) found.add(stem(word))
+    if (word.length >= 3 && !STOP_WORDS.has(word)) found.add(stem(word))
   }
   return [...found]
+}
+
+/**
+ * True when a new line restates an open item: the same first keyword (the
+ * verb, so "add" and "remove" stay apart) and every keyword of the shorter in
+ * the longer. Stricter than `isSimilar`, since a wrong twin loses an item.
+ */
+export function isTwin(a: string, b: string): boolean {
+  const left = keywords(a)
+  const right = keywords(b)
+  if (left.length < 2 || right.length < 2 || left[0] !== right[0]) return false
+  return isSimilar(a, b)
 }
 
 /**

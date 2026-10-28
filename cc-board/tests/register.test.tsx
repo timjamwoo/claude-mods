@@ -260,7 +260,8 @@ test('the pane lists every live session, marks this one and dims stale ones; the
   }
   world.put(`${BOARD_DIR}/sess-B.json`, JSON.stringify(other))
   world.put(`${BOARD_DIR}/sess-C.json`, JSON.stringify({ ...other, sessionId: 'sess-C', project: 'old-repo', updatedAt: '2026-10-10T11:55:00Z' }))
-  world.put(`${BOARD_DIR}/sess-D.json`, JSON.stringify({ ...other, sessionId: 'sess-D', project: 'done-repo', endedAt: '2026-10-20T11:56:00Z' }))
+  // Ended half a minute short of the stale line, so a poll a minute later sees it cross.
+  world.put(`${BOARD_DIR}/sess-D.json`, JSON.stringify({ ...other, sessionId: 'sess-D', project: 'done-repo', updatedAt: '2026-10-19T12:00:30Z', endedAt: '2026-10-19T12:00:30Z' }))
   world.put(`${BOARD_DIR}/broken.json`, '{ this is not json')
 
   // The next poll picks the files up.
@@ -282,6 +283,13 @@ test('the pane lists every live session, marks this one and dims stale ones; the
     expect(await ui.find({ type: 'Button', text: /old-repo/ })).toBeUndefined()
     await ui.unmount()
   }
+
+  // Once the ended session goes stale, the poll alone takes it off the pane: no write is needed.
+  await world.clock.advance(60000)
+  const later = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await later.find({ type: 'Button', text: /done-repo/ })).toBeUndefined()
+  expect(await later.find({ type: 'Button', text: /other-repo/ })).toBeDefined()
+  await later.unmount()
 
   // The band above the prompt is passed on to the engine unless the band option is on. Nothing stands for
   // the engine's own band in a test, so the pass-through surfaces as a mount with no drawing at all.
@@ -817,6 +825,25 @@ test('every few turns the open items are reviewed against the conversation: done
   const scan = await $.command.run({ command: 'board', args: 'scan', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
   expect(asked.filter(isReview).length).toBe(2)
   expect(scan?.text).toBe('cc-board: 0 item(s) closed, 0 loose end(s) added from this chat.')
+})
+
+test('/board scan still reviews the open items when loose-end scans are off', { options: { followUps: false } }, async ($, on) => {
+  const world = fakeWorld(on, [
+    { role: 'user', text: 'rotate the key', toolUses: [] },
+    { role: 'assistant', text: 'Rotated the API key in the portal.', toolUses: [] },
+  ])
+  const asked: string[] = []
+  on('model.complete', (_, e) => {
+    asked.push(e.prompt)
+    const text = e.prompt.includes('Recent conversation:') ? '#1 done' : 'Working'
+    return { value: { isAnswered: true, text, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
+  })
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'manual', args: 'Rotate the API key in the portal', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  const result = await $.command.run({ command: 'board', args: 'scan', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(result?.text).toBe('cc-board: 1 item(s) closed, 0 loose end(s) added from this chat.')
+  expect(asked.filter(prompt => prompt.startsWith('Already on the checklist')).length).toBe(0)
+  expect(world.boardFile('sess-A')?.items[0]?.status).toBe('completed')
 })
 
 test('a long-running chat is scanned for loose ends from its whole history, and /board scan repeats it', async ($, on) => {

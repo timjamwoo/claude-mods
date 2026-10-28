@@ -69,7 +69,6 @@ const HAIKU_GAP_MS = 5 * 60 * 1000
 // A review of every open item against the recent conversation, every so many answered turns.
 const REVIEW_EVERY_TURNS = 6
 const REVIEW_MESSAGES = 24
-const REVIEW_MAX_ITEMS = 60
 
 const checklist = atom({ plugin: 'cc-board', key: 'checklist' } as const, EMPTY_CHECKLIST)
 const summary = atom({ plugin: 'cc-board', key: 'summary' } as const, '')
@@ -209,9 +208,9 @@ async function refreshBoard($: EngineInterface): Promise<void> {
 /** Puts the merged board (local files + gist) into state when it differs from what is drawn. */
 async function publishBoard($: EngineInterface, changed: boolean): Promise<void> {
   const merged = mergeSessions([...sessions.values()], [...remoteSessions.values()])
-  // A session also changes when it crosses the 24h stale line with no write.
+  // A session also changes when it crosses the 24h stale line with no write, ended or not.
   const now = await $.clock.now()
-  const signature = merged.map(s => `${s.sessionId}:${s.updatedAt}:${isLive(s, now)}`).join('|')
+  const signature = merged.map(s => `${s.sessionId}:${s.updatedAt}:${isLive(s, now)}:${isStale(s, now)}`).join('|')
   if (signature !== boardSignature) {
     boardSignature = signature
     changed = true
@@ -613,7 +612,7 @@ async function scanTranscript($: EngineInterface, messages: readonly { role: 'us
 async function reviewOpenItems($: EngineInterface): Promise<number> {
   if (!useAutoDone) return 0
   const list = await read($, checklist)
-  const candidates = list.items.filter(item => item.source !== 'todo' && item.status !== 'completed').slice(0, REVIEW_MAX_ITEMS)
+  const candidates = list.items.filter(item => item.source !== 'todo' && item.status !== 'completed')
   if (candidates.length === 0) return 0
   let verdicts = { done: [] as number[], dropped: [] as number[] }
   try {
@@ -630,7 +629,8 @@ async function reviewOpenItems($: EngineInterface): Promise<number> {
       system:
         'You keep a checklist for a developer. For each item, read the recent conversation and answer: done when the work is shown finished, by the assistant or by the user; obsolete when the conversation has moved on so the item no longer applies (superseded, reverted, decided against); open otherwise. When unsure, answer open. One line per item, in the form "#<number> done", "#<number> obsolete" or "#<number> open". No commentary.',
       prompt: `Checklist:\n${candidates.map(item => `#${item.id} ${item.text}`).join('\n')}\n\nRecent conversation:\n${recent}`,
-      maxTokens: 400,
+      // About eight tokens per verdict line, so a long list is answered in full.
+      maxTokens: Math.min(2000, 60 + candidates.length * 10),
       effort: 'low',
       timeoutMs: 12000,
     })
@@ -1091,7 +1091,7 @@ export const register: Register = (on, options) => {
       return { text: shown ? 'cc-board: completed items shown.' : 'cc-board: completed items hidden.' }
     }
     if (e.args.trim() === 'scan') {
-      if (!useFollowUps) return { text: 'cc-board: loose-end scans are off (followUps).' }
+      if (!useFollowUps && !useAutoDone) return { text: 'cc-board: loose-end scans and reviews are off (followUps, autoDone).' }
       try {
         const messages = await $.session.messages()
         if ('deny' in messages) return { text: 'cc-board: the transcript could not be read.' }

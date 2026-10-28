@@ -18,6 +18,7 @@ import {
   parseHandledIds,
   parseItemId,
   parseReviewLines,
+  isTwin,
   parseManualLines,
   reconcile,
   seedFromTranscript,
@@ -328,13 +329,21 @@ describe('loose ends', () => {
     expect(parseFollowUpLines('Here is what remains from the exchange, excluding what is done:\nThe rest looks fine\nRemaining steps:\nMerge PR #2309 to apply the 22 production migrations once the preview run has been checked by hand\nMerge PR #2309')).toEqual(['Merge PR #2309'])
   })
 
-  test('addFollowUp drops a near twin of an item already listed', async () => {
+  test('addFollowUp drops a near twin of an open item, and only a twin', async () => {
     const first = addFollowUp(EMPTY_CHECKLIST, 'Add a postal address to the two upgrade emails')
     const twin = addFollowUp(first.list, 'Add a postal address to both upgrade emails')
     expect(twin.added).toBe(false)
     expect(twin.list.items.length).toBe(1)
     const other = addFollowUp(first.list, 'Add a postal address to the Halloween broadcast')
     expect(other.added).toBe(true)
+    // A different verb or a different short identifier is a different obligation.
+    expect(isTwin('Add admin role', 'Remove admin role')).toBe(false)
+    expect(isTwin('Renew TLS certificate', 'Renew SSH certificate')).toBe(false)
+    expect(isTwin('Renew the TLS certificate', 'Renew TLS certificate')).toBe(true)
+    // A completed item does not swallow the same obligation raised afresh.
+    const done = addManual(EMPTY_CHECKLIST, 'Rotate the signing key').list
+    const ticked = setTicked(done, 1, true).list
+    expect(addFollowUp(ticked, 'Rotate the signing key again').added).toBe(true)
   })
 
   test('addFollowUp dedupes against any item by normalized text', async () => {
