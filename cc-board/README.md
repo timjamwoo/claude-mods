@@ -95,7 +95,12 @@ By default the board is the local folder, so each machine sees only its own
 sessions. To see every session on one board, including cloud sessions, give
 the mod a Supabase project with a `cc_board` table. Each session then also
 upserts its JSON document as that table's row for its session id, and
-polls the table every fifteen seconds. A GitHub gist would have been
+asks the table every thirty seconds for rows written since its last
+read, and re-reads everything every ten minutes, so a session that
+nothing changed costs a few bytes. The row holds a session's open items
+only, clipped, since that is all other sessions show; the local file keeps
+the whole list. Together these keep the project within a free plan's
+egress quota. A GitHub gist would have been
 simpler, but cloud sessions cannot reach the gist API, so a table it is.
 
 Create a free Supabase project of your own and run this once in its SQL

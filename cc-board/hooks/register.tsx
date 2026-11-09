@@ -58,11 +58,14 @@ import {
   sourceTag,
   STALE_AFTER_MS,
 } from './board'
-import { deleteBeforeUrl, deleteUrl, parseRows, readUrl, sharedHeaders, tableUrl, upsertBody, upsertHeaders } from './shared'
+import { deleteBeforeUrl, deleteUrl, parseRows, readUrl, sharedHeaders, slimSession, tableUrl, upsertBody, upsertHeaders } from './shared'
 
 const PANE = 'cc-board'
 const POLL_MS = 2000
-const REMOTE_POLL_MS = 15000
+// Reads ask only for rows written since the last read, and re-read everything now and then, so a
+// prune elsewhere is noticed. Both keep the project's egress small.
+const REMOTE_POLL_MS = 30000
+const REMOTE_FULL_PULL_MS = 10 * 60 * 1000
 const REMOTE_PUSH_MS = 2000
 const FLUSH_MS = 300
 const HAIKU_GAP_MS = 5 * 60 * 1000
@@ -103,6 +106,9 @@ let remoteFailures = 0
 let pushTimer: Timer | undefined
 let pendingPush: BoardSession | undefined
 let lastPushed = ''
+// The newest row time a read returned, and when the last full read was.
+let remoteSince = ''
+let lastFullPull = 0
 
 // What the summary is derived from.
 let lastPrompt = ''
@@ -227,6 +233,10 @@ async function configureRemote($: EngineInterface): Promise<void> {
   }
   boardUrl = option('boardUrl') || ((await $.env.get('CC_BOARD_URL')) ?? '').trim()
   boardKey = option('boardKey') || ((await $.env.get('CC_BOARD_KEY')) ?? '').trim()
+  remoteSessions.clear()
+  remoteSince = ''
+  lastFullPull = 0
+  lastPushed = ''
   if (boardUrl !== '' && boardKey === '') log($, 'boardUrl is set but no key: the board stays local')
 }
 
@@ -347,7 +357,7 @@ function remoteFailed($: EngineInterface, what: string, status: number | string)
 /** Writes this session's row, a little after the last local write, and only when it changed. */
 function schedulePush($: EngineInterface, snapshot: BoardSession, atOnce: boolean): void {
   if (!isRemoteConfigured()) return
-  pendingPush = snapshot
+  pendingPush = slimSession(snapshot)
   pushTimer?.cancel()
   if (atOnce) {
     void pushRemote($)
@@ -376,15 +386,24 @@ async function pushRemote($: EngineInterface): Promise<void> {
 async function pullRemote($: EngineInterface): Promise<void> {
   if (!isRemoteConfigured()) return
   try {
-    const response = await $.http.fetch(readUrl(boardUrl), { headers: sharedHeaders(boardKey) })
+    const now = await $.clock.now()
+    const full = remoteSince === '' || now - lastFullPull >= REMOTE_FULL_PULL_MS
+    const response = await $.http.fetch(readUrl(boardUrl, full ? undefined : remoteSince), { headers: sharedHeaders(boardKey) })
     if (!response.ok) {
       remoteFailed($, 'read', response.status)
       return
     }
     remoteFailures = 0
-    remoteSessions.clear()
-    for (const session of parseRows(response.text)) remoteSessions.set(session.sessionId, session)
-    await publishBoard($, true)
+    const rows = parseRows(response.text)
+    if (full) {
+      lastFullPull = now
+      remoteSessions.clear()
+    }
+    for (const session of rows) {
+      remoteSessions.set(session.sessionId, session)
+      if (session.updatedAt > remoteSince) remoteSince = session.updatedAt
+    }
+    if (full || rows.length > 0) await publishBoard($, true)
   } catch (error) {
     remoteFailed($, 'read', String(error))
   }
