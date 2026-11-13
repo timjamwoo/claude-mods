@@ -1,7 +1,8 @@
 // Pure helpers for the shared board in a Supabase table: one row per session
 // in `cc_board`, reached through the project's REST API. No engine access.
 import type { BoardSession } from '../types'
-import { parseValue } from './board'
+import { clip, parseValue } from './board'
+import { openItems } from './checklist'
 
 export const TABLE = 'cc_board'
 
@@ -12,9 +13,19 @@ export function tableUrl(projectUrl: string): string {
 /** How many sessions one read brings back, newest first. Older rows are stale by then and prune removes them by time. */
 export const READ_LIMIT = 500
 
-/** The query that reads the newest rows' documents. */
-export function readUrl(projectUrl: string): string {
-  return `${tableUrl(projectUrl)}?select=payload&order=updated_at.desc&limit=${READ_LIMIT}`
+/** The query that reads the newest rows' documents, or with `sinceIso`, only the rows written after that moment. */
+export function readUrl(projectUrl: string, sinceIso?: string): string {
+  const since = sinceIso === undefined ? '' : `&updated_at=gt.${encodeURIComponent(sinceIso)}`
+  return `${tableUrl(projectUrl)}?select=payload&order=updated_at.desc&limit=${READ_LIMIT}${since}`
+}
+
+/**
+ * The row other sessions need: open items only, each clipped, since the board
+ * shows other sessions' open work and nothing else. Keeps the table small and
+ * every read cheap; the local file keeps the whole list.
+ */
+export function slimSession(session: BoardSession): BoardSession {
+  return { ...session, items: openItems(session.items).map(item => ({ ...item, text: clip(item.text, 100) })) }
 }
 
 /** The query that deletes every row last updated before `beforeIso`, whether a read returned it or not. */

@@ -413,7 +413,9 @@ function fakeTable(on: On, rows: Record<string, unknown>) {
     if (method === 'GET') {
       // Newest first, capped as PostgREST caps a read.
       const limit = Number(/limit=(\d+)/.exec(e.url)?.[1] ?? 1000)
-      const rows = [...table.values()] as { updatedAt: string }[]
+      const since = /updated_at=gt\.([^&]+)/.exec(e.url)?.[1]
+      let rows = [...table.values()] as { updatedAt: string }[]
+      if (since !== undefined) rows = rows.filter(row => Date.parse(row.updatedAt) > Date.parse(decodeURIComponent(since)))
       rows.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
       const text = JSON.stringify(rows.slice(0, limit).map(payload => ({ payload })))
       return { value: { status: 200, ok: true, headers: {}, text } }
@@ -459,6 +461,41 @@ test('with a shared board configured, this session’s row is upserted after a s
   expect(mirrored?.items.map(item => item.text)).toEqual(['Fix login', 'Rotate key'])
   expect(mirrored?.machine).toBe('mbp')
   expect(JSON.stringify(remote.table.get('sess-A'))).toBe(JSON.stringify(JSON.parse(world.files.get(`${BOARD_DIR}/sess-A.json`)?.text ?? '')))
+
+  // A done item stays in the local file and leaves the row: other sessions only need the open work.
+  await $.command.run({ command: 'done', args: '1', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  await world.clock.advance(2000)
+  expect(world.boardFile('sess-A')?.items.length).toBe(2)
+  expect(parse(JSON.stringify(remote.table.get('sess-A')))?.items.map(item => item.text)).toEqual(['Rotate key'])
+})
+
+test('reads after the first ask only for rows written since, and re-read everything every ten minutes', { ...OPTIONS }, async ($, on) => {
+  const world = fakeWorld(on)
+  const other = { sessionId: 'sess-cloud', project: 'other-repo', cwd: '/work/other-repo', summary: 'Starting', items: [], updatedAt: '2026-10-20T11:55:00Z', machine: 'cloud' }
+  const remote = fakeTable(on, { 'sess-cloud': other })
+  await $.session.start({ cwd: '/work/my-app', surface: 'terminal', isInteractive: true })
+  const reads = () => remote.calls.filter(call => call.method === 'GET')
+  expect(reads().length).toBe(1)
+  expect(reads()[0]?.url).not.toContain('updated_at=gt.')
+
+  // The next poll asks for rows after the newest seen; it gets this session's own row back, and nothing else.
+  await world.clock.advance(30000)
+  expect(reads().length).toBe(2)
+  expect(reads()[1]?.url).toContain('updated_at=gt.2026-10-20T11%3A55%3A00Z')
+
+  // A row written since arrives on the next poll and the pane picks it up.
+  remote.table.set('sess-cloud', { ...other, summary: 'Adding the settings page', updatedAt: '2026-10-20T12:00:20Z' })
+  await world.clock.advance(30000)
+  expect(reads()[2]?.url).toContain('updated_at=gt.2026-10-20T12%3A00%3A00')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Adding the settings page/ })).toBeDefined()
+  await ui.unmount()
+  expect(reads()[3]?.url ?? '').toBe('')
+
+  // Ten minutes on, one read takes everything again, so a prune elsewhere is noticed.
+  await world.clock.advance(10 * 60 * 1000)
+  const full = reads().filter(call => !call.url.includes('updated_at=gt.'))
+  expect(full.length).toBe(2)
 })
 
 test('sessions from the shared board join the pane, and prune deletes from both stores', { ...OPTIONS }, async ($, on) => {
