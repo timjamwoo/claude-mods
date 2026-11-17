@@ -330,32 +330,31 @@ function quote(items: readonly ChecklistItem[]): string {
  * One compact note for Claude about what changed since the last note. Only
  * the kinds of change that happened are mentioned.
  */
+/**
+ * The note Claude gets about the person's own checklist actions, or '' when
+ * nothing in `changes` is one. The plugin's own doings (a loose end it noted,
+ * an item it ticked or dropped on review) are never reported: the model read
+ * an earlier form of that as the person's instructions and left work undone.
+ */
 export function describeChanges(changes: readonly Change[]): string {
   const of = (kind: Change['kind']) => changes.filter(change => change.kind === kind).map(change => change.item)
   const ticked = of('ticked')
   const unticked = of('unticked')
   const manual = of('manual-added')
-  const followUps = of('followup-added')
   const kept = of('kept-done')
-  const auto = of('auto-done')
-  const dropped = of('dropped')
 
   const parts: string[] = []
-  if (ticked.length > 0) parts.push(`The user ticked these done: ${quote(ticked)}.`)
-  if (auto.length > 0) parts.push(`Marked done because the conversation shows them handled: ${quote(auto)}.`)
-  if (dropped.length > 0) parts.push(`Dropped as no longer relevant: ${quote(dropped)}.`)
+  if (ticked.length > 0) parts.push(`The user ticked these done in the pane: ${quote(ticked)}.`)
   if (kept.length > 0) {
-    parts.push(`These stay done because the user ticked them, although your TodoWrite reopened them: ${quote(kept)}.`)
+    parts.push(`These stay done because the user ticked them, although a task update reopened them: ${quote(kept)}.`)
   }
-  if (unticked.length > 0) parts.push(`The user reopened: ${quote(unticked)}.`)
-  if (manual.length > 0) parts.push(`New manual steps the user will do by hand (not you): ${quote(manual)}.`)
-  if (followUps.length > 0) {
-    parts.push(`Loose ends noted on the user's checklist so they are not forgotten (no action from you unless asked): ${quote(followUps)}.`)
+  if (unticked.length > 0) parts.push(`The user reopened these in the pane: ${quote(unticked)}.`)
+  if (manual.length > 0) parts.push(`The user added these as steps they will do themselves: ${quote(manual)}.`)
+  if (parts.length === 0) return ''
+  if (ticked.length > 0 || kept.length > 0) {
+    parts.push('Leave the ticked items out of your task list and do not remind the user of them.')
   }
-  if (ticked.length > 0 || kept.length > 0 || auto.length > 0 || dropped.length > 0) {
-    parts.push('Do not remind the user about done items or add them back to TodoWrite.')
-  }
-  return `[cc-board] Checklist update. ${parts.join(' ')}`
+  return `[cc-board] Automated note from the cc-board plugin, not a message from the user. It reports what the user did in their checklist pane and changes nothing else about your work. ${parts.join(' ')}`
 }
 
 /** The part of a transcript message the seed needs; `$.session.messages()` rows fit it. */
