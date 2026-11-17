@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { BoardSession } from '../types'
-import { basename, boardLine, cheapSummary, cleanPrompt, displayName, fullBoardText, isLive, isStale, parse, serialize, sessionDetail, sessionHeading } from '../hooks/board'
+import { basename, boardLine, cheapSummary, checklistMarkdown, cleanPrompt, displayName, fullBoardText, isLive, isStale, parse, serialize, sessionDetail, sessionHeading } from '../hooks/board'
 
 const NOW = Date.parse('2026-10-20T12:00:00Z')
 
@@ -87,6 +87,10 @@ describe('summary and lines', () => {
     expect(parse(serialize(titled))?.title).toBe('Main Storied Thread (Local)')
     expect(parse(serialize({ ...session, title: '  ' } as typeof titled))?.title).toBeUndefined()
     expect(fullBoardText([titled], 'sess-a', NOW)).toContain('Main Storied Thread (Local) ·')
+  })
+
+  test('the checklist copies as a Markdown task list under a heading', async () => {
+    expect(checklistMarkdown('Main Storied Thread', session.items)).toBe('## Main Storied Thread\n- [ ] Fix login\n- [x] Rotate key')
   })
 
   test('the full board lists open items and the resume command', async () => {

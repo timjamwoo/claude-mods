@@ -42,6 +42,7 @@ import {
   basename,
   boardLine,
   cheapSummary,
+  checklistMarkdown,
   cleanPrompt,
   clip,
   displayName,
@@ -894,6 +895,24 @@ function itemLabel(item: ChecklistItem): string {
 
 // ---- Hooks ----------------------------------------------------------------
 
+/**
+ * Puts the checklist on the clipboard as Markdown: the items the pane shows
+ * (open ones, or all with the done ones shown). Resolves what the toast said.
+ */
+async function copyChecklist($: EngineInterface, surface?: RenderSurface): Promise<string> {
+  const list = await read($, checklist)
+  const items = (await read($, showDone)) ? list.items : openItems(list.items)
+  if (items.length === 0) {
+    $.ui.toast('nothing to copy')
+    return 'nothing to copy'
+  }
+  const text = checklistMarkdown(title === '' ? project : title, items)
+  const copied = await $.ui.copy(surface === undefined ? { text } : { text, surface }).catch(() => ({ isCopied: false as const, reason: 'failed' }))
+  const said = copied.isCopied ? `copied ${items.length} item(s) as Markdown` : 'copy failed: the clipboard could not be reached'
+  $.ui.toast(said)
+  return said
+}
+
 /** Records a changed session title and rewrites the board file so the other sessions see it. */
 async function noteTitle($: EngineInterface, fresh: string | undefined): Promise<void> {
   const next = (fresh ?? '').trim()
@@ -1110,6 +1129,7 @@ export const register: Register = (on, options) => {
       void $.ui.open({ id: PANE, title: 'cc-board' })
       return { text: shown ? 'cc-board: completed items shown.' : 'cc-board: completed items hidden.' }
     }
+    if (e.args.trim() === 'copy') return { text: `cc-board: ${await copyChecklist($)}` }
     if (e.args.trim() === 'scan') {
       if (!useFollowUps && !useAutoDone) return { text: 'cc-board: loose-end scans and reviews are off (followUps, autoDone).' }
       try {
@@ -1185,6 +1205,9 @@ export const register: Register = (on, options) => {
             label={showingDone ? `hide ${doneCount} done` : `show ${doneCount} done`}
             onPress={() => void update($, showDone, (value: boolean) => !value)}
           />
+        )}
+        {shown.length > 0 && (
+          <Button key="copy-list" plain dimColor label="copy list" onPress={press => void copyChecklist($, press.surface)} />
         )}
         {list.items.length > 0 && <Text dimColor>Click an item to tick it, or /done {'<id>'}.</Text>}
       </Box>
