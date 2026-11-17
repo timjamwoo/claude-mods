@@ -425,7 +425,8 @@ function fakeTable(on: On, rows: Record<string, unknown>) {
       return { value: { status: 200, ok: true, headers: {}, text } }
     }
     if (method === 'POST') {
-      for (const row of JSON.parse(e.init?.body ?? '[]') as { session_id: string; payload: unknown }[]) table.set(row.session_id, row.payload)
+      const body = typeof e.init?.body === 'string' ? e.init.body : '[]'
+      for (const row of JSON.parse(body) as { session_id: string; payload: unknown }[]) table.set(row.session_id, row.payload)
       call.status = 201
       return { value: { status: 201, ok: true, headers: {}, text: '' } }
     }
