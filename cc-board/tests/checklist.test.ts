@@ -109,8 +109,8 @@ describe('describeChanges and parseItemId', () => {
     const note = describeChanges([{ kind: 'ticked', item }])
     expect(note).toContain('#3 "Rotate key"')
     expect(note).toContain('ticked these done')
-    expect(note).toContain('Do not remind')
-    expect(note).not.toContain('manual steps')
+    expect(note).toContain('do not remind the user')
+    expect(note).not.toContain('steps they will do themselves')
   })
 
   test('parses /done arguments', async () => {
@@ -281,13 +281,9 @@ describe('handled items', () => {
     const result = markHandled({ items, nextId: 5 }, [1, 4])
     expect(result.items.map(item => item.id)).toEqual([1])
     expect(result.list.items[0]).toEqual({ ...items[0], status: 'completed' })
-    const note = describeChanges([{ kind: 'auto-done', item: result.items[0]! }])
-    expect(note).toContain('shows them handled')
-    expect(note).toContain('#1 "Rotate the API key in the portal"')
-    expect(note).toContain('Do not remind')
-    const dropped = describeChanges([{ kind: 'dropped', item: result.items[0]! }])
-    expect(dropped).toContain('Dropped as no longer relevant')
-    expect(dropped).toContain('Do not remind')
+    // The plugin's own ticks and drops are not reported to Claude: only the person's actions are.
+    expect(describeChanges([{ kind: 'auto-done', item: result.items[0]! }])).toBe('')
+    expect(describeChanges([{ kind: 'dropped', item: result.items[0]! }])).toBe('')
   })
 
   test('parseReviewLines reads one verdict per item and ignores the rest', async () => {
@@ -355,11 +351,13 @@ describe('loose ends', () => {
     expect(fresh.list.items.length).toBe(2)
   })
 
-  test('describeChanges tells Claude loose ends are noted, not assigned', async () => {
+  test('describeChanges says nothing about loose ends, and names the plugin as the author of what it does say', async () => {
     const item = { id: 4, text: 'Bump the version', source: 'followup' as const, status: 'pending' as const, ticked: false }
-    const note = describeChanges([{ kind: 'followup-added', item }])
-    expect(note).toContain('Loose ends noted')
-    expect(note).toContain('#4 "Bump the version"')
-    expect(note).toContain('no action from you')
+    expect(describeChanges([{ kind: 'followup-added', item }])).toBe('')
+    const note = describeChanges([{ kind: 'followup-added', item }, { kind: 'ticked', item: { ...item, status: 'completed', ticked: true } }])
+    expect(note).toContain('Automated note from the cc-board plugin, not a message from the user')
+    expect(note).toContain('changes nothing else about your work')
+    expect(note).toContain('ticked these done in the pane: #4 "Bump the version"')
+    expect(note).not.toContain('Loose ends')
   })
 })

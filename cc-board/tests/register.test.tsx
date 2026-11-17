@@ -28,6 +28,7 @@ const BAND = {
   component: 'AbovePrompt',
   props: {
     hasSurvey: false,
+    isCollapsed: false,
     isWorking: false,
     maxRows: 10,
     bodyColumns: 80,
@@ -241,7 +242,7 @@ test('a MANUAL: line in Claude’s reply and /manual both add manual steps', asy
   await world.clock.advance(300)
   // Both additions landed within the pause, so Claude gets one note, not two.
   expect(world.noteCount()).toBe(1)
-  expect(world.lastNote()).toContain('manual steps')
+  expect(world.lastNote()).toContain('steps they will do themselves')
   expect(world.lastNote()).toContain('#1 "Submit the build in App Store Connect"')
   expect(world.lastNote()).toContain('#2 "Rotate the key in the portal"')
 })
@@ -293,13 +294,16 @@ test('the pane lists every live session, marks this one and dims stale ones; the
 
   // The band above the prompt is passed on to the engine unless the band option is on. Nothing stands for
   // the engine's own band in a test, so the pass-through surfaces as a mount with no drawing at all.
-  let outcome = ''
+  // Depending on the kit's build, that surfaces as a mount with no drawing at all or as a mount with no session rows.
+  let drewSessions = false
   try {
-    await $.ui.mount({ ...BAND, surface: 'desktop' })
+    const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+    drewSessions = (await band.find({ type: 'Button', text: /my-app/ })) !== undefined
+    await band.unmount()
   } catch (error) {
-    outcome = String(error)
+    drewSessions = !String(error).includes('ui.render')
   }
-  expect(outcome).toContain('no implementation for ui.render')
+  expect(drewSessions).toBe(false)
 })
 
 test('with the band option on, the sessions are drawn above the prompt as well', { options: { band: true } }, async ($, on) => {
@@ -404,7 +408,7 @@ function fakeTable(on: On, rows: Record<string, unknown>) {
   on('http.fetch', (_, e) => {
     const method = e.init?.method ?? 'GET'
     const headers = e.init?.headers ?? {}
-    const call = { method, url: e.url, status: 200, headers, body: e.init?.body }
+    const call = { method, url: e.url, status: 200, headers, body: typeof e.init?.body === 'string' ? e.init.body : undefined }
     calls.push(call)
     if (headers.apikey !== 'secret') {
       call.status = 401
@@ -640,9 +644,9 @@ test('a completed turn that mentions something for later puts it on the checklis
     [1, 'Rotate the API key in the portal', 'followup'],
     [2, 'Bump the version before release', 'followup'],
   ])
+  // Loose ends are the plugin's own doing, so Claude hears nothing about them.
   await world.clock.advance(300)
-  expect(world.lastNote()).toContain('Loose ends noted')
-  expect(world.lastNote()).toContain('#1 "Rotate the API key in the portal"')
+  expect(world.noteCount()).toBe(0)
 
   // The same loose ends again: the scan sees them on the checklist, nothing is added twice.
   await $.prompt.submit({ text: 'remind me what is left', origin: { kind: 'composer' }, wait: false })
@@ -794,9 +798,10 @@ test('a turn that does a loose end ticks it off, and the pane hides done items u
     [1, 'completed', false],
     [2, 'pending', false],
   ])
+  // An item the plugin ticked itself is not reported to Claude; the two manual steps were, earlier.
   await world.clock.advance(300)
-  expect(world.lastNote()).toContain('shows them handled')
-  expect(world.lastNote()).toContain('#1 "Rotate the API key in the portal"')
+  expect(world.noteCount()).toBe(1)
+  expect(world.lastNote()).toContain('steps they will do themselves')
 
   // The pane shows open items only, with a toggle that reveals the done ones.
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -855,8 +860,8 @@ test('every few turns the open items are reviewed against the conversation: done
   ])
   expect(world.toasts.at(-1)).toBe('review: 1 done, 1 dropped')
   await world.clock.advance(300)
-  expect(world.lastNote()).toContain('shows them handled: #1')
-  expect(world.lastNote()).toContain('Dropped as no longer relevant: #2')
+  expect(world.noteCount()).toBe(1)
+  expect(world.lastNote()).not.toContain('Dropped')
 
   // /board scan reviews too, and says what it closed.
   const scan = await $.command.run({ command: 'board', args: 'scan', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })

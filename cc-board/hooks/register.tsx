@@ -445,6 +445,7 @@ async function flushChanges($: EngineInterface): Promise<void> {
   if (pending.length === 0) return
   const text = describeChanges(pending)
   pending = []
+  if (text === '') return
   try {
     const result = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
     if (result.deny !== undefined) log($, `note refused: ${result.deny}`)

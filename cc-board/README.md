@@ -25,8 +25,8 @@ finishes the item. Every six answered turns, and whenever a session resumes
 with open items, the whole open list is reviewed against the recent
 conversation in one Haiku call: what it shows done is ticked, what it
 shows no longer relevant (superseded, reverted, decided against) is
-dropped, and Claude is told either way. Turn all of this off with the
-`autoDone` option.
+dropped. Claude is told nothing about any of this. Turn it all off with
+the `autoDone` option.
 
 **Loose ends get surfaced.** The real point of the checklist is the small
 things said in passing and then forgotten: "you'll need to rotate the key
@@ -34,8 +34,9 @@ later", "I've skipped the store listing for now", "oh, and remind me to
 bump the version". After a completed turn whose prompt or reply contains a
 cue phrase like those, Haiku reads that one exchange and lists the loose
 ends, which join the checklist tagged `(loose end)`. Nothing already on
-the list is added twice, and Claude is told they were noted for you, not
-assigned to it. The first time the mod meets a session it scans the whole
+the list is added twice. Claude is told nothing about them: an earlier
+version said they were noted for you, and Claude read that as your
+instruction to leave the work alone. The first time the mod meets a session it scans the whole
 conversation for loose ends mentioned before it loaded, and `/board scan`
 does so on demand. Turn all of this off with the `followUps` option.
 
@@ -224,7 +225,10 @@ desktop surfaces, and both restore paths at startup.
 ## What it does not do
 
 It never answers or changes a tool call, and the only text it adds to a
-request is the checklist note. It makes four kinds of network call, each
+request is the checklist note, which reports only what you did in the
+pane (a tick, an untick, a manual step), opens by saying it comes from
+the plugin and not from you, and is never sent for anything the plugin
+did on its own. It makes four kinds of network call, each
 with its own switch: the Haiku summary (`haikuSummary`), the Haiku
 loose-end scan of an exchange that carries a cue phrase (`followUps`), the
 Haiku check of whether an exchange or the recent conversation handled an
