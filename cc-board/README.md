@@ -14,7 +14,9 @@ or from any line in Claude's reply that starts with `MANUAL:`. Each row is a
 button: click it in the Desktop Code tab or in a fullscreen terminal, or
 Tab to it and press Enter. `/done <id>` ticks an item from the keyboard.
 Done items are hidden; a `show N done` button at the foot of the list, or
-`/board done`, brings them back.
+`/board done`, brings them back. A `copy list` button beside it, or
+`/board copy`, puts the items shown on the clipboard as a Markdown task
+list, ready to paste into a note or a ticket.
 
 **Handled items tick themselves.** Claude's own tasks complete through the
 Task tools. A manual step or loose end is ticked when a later exchange

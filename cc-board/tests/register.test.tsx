@@ -765,6 +765,30 @@ test('the session title from the classic hooks names the session on the board, a
   expect(world.boardFile('sess-B')?.title).toBe('Concairge')
 })
 
+test('the copy button and /board copy put the shown items on the clipboard as Markdown', async ($, on) => {
+  const world = fakeWorld(on)
+  on('session.surfaces', () => ({ value: ['desktop'] }))
+  await $.session.start({ cwd: '/work/my-app', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'TodoWrite', todos: [...TODOS] })
+  await $.command.run({ command: 'done', args: '1', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+
+  // Done items are hidden, so only the open one is copied.
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'copy-list' })
+  expect(world.copied.at(-1)).toBe('## my-app\n- [ ] Rotate key')
+  expect(world.toasts.at(-1)).toBe('copied 1 item(s) as Markdown')
+
+  // With done items shown, they come along, ticked.
+  await ui.press({ key: 'toggle-done' })
+  await ui.press({ key: 'copy-list' })
+  expect(world.copied.at(-1)).toBe('## my-app\n- [x] Fix login\n- [ ] Rotate key')
+  await ui.unmount()
+
+  const result = await $.command.run({ command: 'board', args: 'copy', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(result?.text).toBe('cc-board: copied 2 item(s) as Markdown')
+  expect(world.copied.length).toBe(3)
+})
+
 test('a turn that does a loose end ticks it off, and the pane hides done items until asked', async ($, on) => {
   const world = fakeWorld(on)
   const asked: string[] = []

@@ -198,6 +198,16 @@ function mark(item: ChecklistItem): string {
   return '[ ]'
 }
 
+/**
+ * The checklist as Markdown to paste elsewhere: a heading, then one task-list
+ * line per item, done ones ticked. No ids or tags, which mean nothing outside
+ * the pane.
+ */
+export function checklistMarkdown(heading: string, items: readonly ChecklistItem[]): string {
+  const lines = items.map(item => `- [${item.status === 'completed' ? 'x' : ' '}] ${item.text}`)
+  return [`## ${heading}`, ...lines].join('\n')
+}
+
 /** What /board prints: every session, its open items and how to get back to it. */
 export function fullBoardText(sessions: readonly BoardSession[], currentId: string, nowMs: number, homeMachine?: string): string {
   if (sessions.length === 0) return 'cc-board: no sessions on the board yet.'
