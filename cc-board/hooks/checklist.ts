@@ -444,3 +444,95 @@ export function seedFromTranscript(messages: readonly TranscriptMessage[]): Chec
   }
   return list
 }
+
+/** What Claude can ask of the checklist tool. */
+export type ChecklistOp =
+  | { action: 'list'; includeDone?: boolean }
+  | { action: 'tick' | 'reopen' | 'drop'; ids: number[] }
+  | { action: 'edit'; id: number; text: string }
+  | { action: 'merge'; ids: number[]; text: string }
+  | { action: 'add'; text: string }
+
+/** Reads the tool's loose arguments into an operation, or says what is wrong with them. */
+export function parseChecklistOp(input: Record<string, unknown>): ChecklistOp | string {
+  const action = input.action
+  const ids = Array.isArray(input.ids) ? input.ids.filter((id): id is number => Number.isInteger(id)) : []
+  const text = typeof input.text === 'string' ? input.text.trim() : ''
+  switch (action) {
+    case 'list':
+      return { action, includeDone: input.include_done === true }
+    case 'tick':
+    case 'reopen':
+    case 'drop':
+      return ids.length > 0 ? { action, ids } : `${action} needs ids: the item numbers to change.`
+    case 'edit': {
+      const id = Number.isInteger(input.id) ? (input.id as number) : ids[0]
+      if (id === undefined) return 'edit needs id: the item number to reword.'
+      return text !== '' ? { action, id, text } : 'edit needs text: the new wording.'
+    }
+    case 'merge':
+      if (ids.length < 2) return 'merge needs ids: two or more item numbers.'
+      return text !== '' ? { action, ids, text } : 'merge needs text: the wording of the merged item.'
+    case 'add':
+      return text !== '' ? { action, text } : 'add needs text: the item to add.'
+    default:
+      return 'action must be one of list, tick, reopen, edit, merge, drop, add.'
+  }
+}
+
+/** One line per item as the tool shows them: number, state, text, and where it came from. */
+export function describeItems(items: readonly ChecklistItem[]): string {
+  if (items.length === 0) return '(the checklist is empty)'
+  return items
+    .map(item => {
+      const state = item.status === 'completed' ? 'done' : item.status === 'in_progress' ? 'in progress' : 'open'
+      const from = item.source === 'todo' ? 'task' : item.source === 'manual' ? 'manual step' : 'loose end'
+      return `#${item.id} [${state}] ${item.text} (${from})`
+    })
+    .join('\n')
+}
+
+/**
+ * Applies one change Claude asked for. Unknown ids are reported, not guessed
+ * at. A tick by Claude completes the item without counting as the person's
+ * own tick, so a later task update may still move it.
+ */
+export function applyChecklistOp(
+  list: Checklist,
+  op: Exclude<ChecklistOp, { action: 'list' }>,
+): { list: Checklist; summary: string } | { error: string } {
+  const known = new Set(list.items.map(item => item.id))
+  const wanted = op.action === 'edit' ? [op.id] : op.action === 'add' ? [] : op.ids
+  const missing = wanted.filter(id => !known.has(id))
+  if (missing.length > 0) return { error: `No item ${missing.map(id => `#${id}`).join(', ')} on the checklist. Call list to see the numbers.` }
+
+  switch (op.action) {
+    case 'tick':
+    case 'reopen': {
+      const status = op.action === 'tick' ? ('completed' as const) : ('pending' as const)
+      const items = list.items.map(item => (op.ids.includes(item.id) ? { ...item, status, ticked: false } : item))
+      return { list: { ...list, items }, summary: `${op.action === 'tick' ? 'Ticked' : 'Reopened'} ${op.ids.map(id => `#${id}`).join(', ')}.` }
+    }
+    case 'drop': {
+      const items = list.items.filter(item => !op.ids.includes(item.id))
+      return { list: { ...list, items }, summary: `Dropped ${op.ids.map(id => `#${id}`).join(', ')}.` }
+    }
+    case 'edit': {
+      const items = list.items.map(item => (item.id === op.id ? { ...item, text: op.text } : item))
+      return { list: { ...list, items }, summary: `Reworded #${op.id}.` }
+    }
+    case 'merge': {
+      const [keep, ...rest] = op.ids as [number, ...number[]]
+      const merged = list.items.filter(item => op.ids.includes(item.id))
+      const allDone = merged.every(item => item.status === 'completed')
+      const items = list.items
+        .filter(item => !rest.includes(item.id))
+        .map(item => (item.id === keep ? { ...item, text: op.text, status: allDone ? item.status : ('pending' as const), ticked: allDone && item.ticked } : item))
+      return { list: { ...list, items }, summary: `Merged ${op.ids.map(id => `#${id}`).join(', ')} into #${keep}.` }
+    }
+    case 'add': {
+      const result = addFollowUp(list, op.text)
+      return { list: result.list, summary: result.added ? `Added #${result.item.id}.` : `Already listed as #${result.item.id}.` }
+    }
+  }
+}

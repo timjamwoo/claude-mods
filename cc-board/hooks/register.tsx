@@ -18,14 +18,17 @@ import {
   EMPTY_CHECKLIST,
   addFollowUp,
   addManual,
+  applyChecklistOp,
   applyTaskEvent,
   candidatesHandled,
   cueExcerpts,
   describeChanges,
+  describeItems,
   hasLooseEndCue,
   markHandled,
   mergeTodos,
   openItems,
+  parseChecklistOp,
   parseHandledIds,
   parseItemId,
   parseReviewLines,
@@ -62,6 +65,11 @@ import {
 import { deleteBeforeUrl, deleteUrl, parseRows, readUrl, sharedHeaders, slimSession, tableUrl, upsertBody, upsertHeaders } from './shared'
 
 const PANE = 'cc-board'
+// The tool Claude uses to read and change the checklist, when the person asks it to.
+const TOOL = 'checklist'
+const TOOL_NAME = 'mcp__cc-board__checklist'
+const TOOL_DESCRIPTION =
+  "Reads and edits the user's cc-board checklist: the numbered to-do items shown in their cc-board pane. Use it only when the user asks about their checklist or to-do list, for example \"tackle item 3\", \"consolidate the to-do list\" or \"tick off the key rotation\", and to tick an item once you have finished work the user pointed you at. Never act on items unprompted. Actions: list (include_done to see finished ones too), tick and reopen (ids), edit (id, text), merge (ids, text: keeps the first id with the new wording and removes the rest), drop (ids), add (text). Item numbers are stable for the session."
 const POLL_MS = 2000
 // Reads ask only for rows written since the last read, and re-read everything now and then, so a
 // prune elsewhere is noticed. Both keep the project's egress small.
@@ -913,6 +921,31 @@ async function copyChecklist($: EngineInterface, surface?: RenderSurface): Promi
   return said
 }
 
+/** Serves one call of the checklist tool: the text Claude reads back, and whether it is an error. */
+async function runChecklistTool($: EngineInterface, input: Record<string, unknown>): Promise<{ text: string; isError: boolean }> {
+  const op = parseChecklistOp(input)
+  if (typeof op === 'string') return { text: op, isError: true }
+  if (op.action === 'list') {
+    const list = await read($, checklist)
+    const items = op.includeDone === true ? list.items : openItems(list.items)
+    const hidden = list.items.length - items.length
+    const tail = hidden > 0 ? `\n(${hidden} done item(s) hidden; list with include_done to see them.)` : ''
+    return { text: `${describeItems(items)}${tail}`, isError: false }
+  }
+  let outcome: { summary: string } | { error: string } = { error: 'nothing changed' }
+  await update($, checklist, (list: Checklist) => {
+    const result = applyChecklistOp(list, op)
+    outcome = result
+    return 'list' in result ? result.list : list
+  })
+  const done = outcome as { summary: string } | { error: string }
+  if ('error' in done) return { text: done.error, isError: true }
+  await refreshSummary($, false)
+  await writeBoardFile($)
+  const list = await read($, checklist)
+  return { text: `${done.summary}\nOpen now:\n${describeItems(openItems(list.items))}`, isError: false }
+}
+
 /** Records a changed session title and rewrites the board file so the other sessions see it. */
 async function noteTitle($: EngineInterface, fresh: string | undefined): Promise<void> {
   const next = (fresh ?? '').trim()
@@ -957,6 +990,26 @@ export const register: Register = (on, options) => {
       await registerCommands($)
     } catch (error) {
       log($, `command registration failed: ${String(error)}`)
+    }
+    try {
+      await $.tool.register({
+        name: TOOL,
+        description: TOOL_DESCRIPTION,
+        isDeferred: false,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'tick', 'reopen', 'edit', 'merge', 'drop', 'add'] },
+            ids: { type: 'array', items: { type: 'integer' }, description: 'Item numbers, for tick, reopen, merge and drop.' },
+            id: { type: 'integer', description: 'The item number, for edit.' },
+            text: { type: 'string', description: 'The wording, for edit, merge and add. Short: at most about eight words.' },
+            include_done: { type: 'boolean', description: 'For list: include finished items.' },
+          },
+          required: ['action'],
+        },
+      })
+    } catch (error) {
+      log($, `tool registration failed: ${String(error)}`)
     }
 
     void $.ui.open({ id: PANE, title: 'cc-board' })
@@ -1024,6 +1077,17 @@ export const register: Register = (on, options) => {
       }
     }
     return ran
+  })
+
+  on('tool.call', { tool: TOOL_NAME }, async ($, e) => {
+    if (e.agentId !== undefined) return { deny: 'The checklist belongs to the main conversation; a subagent cannot change it.' }
+    try {
+      const { text, isError } = await runChecklistTool($, e as unknown as Record<string, unknown>)
+      return isError ? { result: text, isError: true as const } : { result: text }
+    } catch (error) {
+      log($, `checklist tool failed: ${String(error)}`)
+      return { result: `The checklist could not be changed: ${String(error)}`, isError: true as const }
+    }
   })
 
   on('tool.call', { tool: 'TaskUpdate' }, async ($, e, next) => {
