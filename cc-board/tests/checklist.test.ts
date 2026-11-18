@@ -4,10 +4,12 @@ import type { Checklist } from '../types'
 import {
   addFollowUp,
   addManual,
+  applyChecklistOp,
   applyTaskEvent,
   candidatesHandled,
   cueExcerpts,
   describeChanges,
+  describeItems,
   EMPTY_CHECKLIST,
   hasLooseEndCue,
   isSimilar,
@@ -16,6 +18,7 @@ import {
   mergeTodos,
   parseFollowUpLines,
   parseHandledIds,
+  parseChecklistOp,
   parseItemId,
   parseReviewLines,
   isTwin,
@@ -359,5 +362,64 @@ describe('loose ends', () => {
     expect(note).toContain('changes nothing else about your work')
     expect(note).toContain('ticked these done in the pane: #4 "Bump the version"')
     expect(note).not.toContain('Loose ends')
+  })
+})
+
+describe('the checklist tool', () => {
+  const list: Checklist = {
+    items: [
+      { id: 1, text: 'Add a postal address to the upgrade email', source: 'followup', status: 'pending', ticked: false },
+      { id: 2, text: 'Add the postal address to both upgrade emails', source: 'followup', status: 'pending', ticked: false },
+      { id: 3, text: 'Merge PR #2309', source: 'manual', status: 'pending', ticked: false },
+      { id: 4, text: 'Fix login', source: 'todo', status: 'completed', ticked: false, taskId: 't-1' },
+    ],
+    nextId: 5,
+  }
+
+  test('parseChecklistOp reads each action and explains what is missing', async () => {
+    expect(parseChecklistOp({ action: 'list', include_done: true })).toEqual({ action: 'list', includeDone: true })
+    expect(parseChecklistOp({ action: 'tick', ids: [3, 'x'] })).toEqual({ action: 'tick', ids: [3] })
+    expect(parseChecklistOp({ action: 'edit', id: 3, text: ' Merge #2309 ' })).toEqual({ action: 'edit', id: 3, text: 'Merge #2309' })
+    expect(parseChecklistOp({ action: 'merge', ids: [1] , text: 'x' })).toContain('two or more')
+    expect(parseChecklistOp({ action: 'tick' })).toContain('needs ids')
+    expect(parseChecklistOp({ action: 'explode' })).toContain('must be one of')
+  })
+
+  test('describeItems numbers each item with its state and origin', async () => {
+    expect(describeItems(list.items.slice(2))).toBe('#3 [open] Merge PR #2309 (manual step)\n#4 [done] Fix login (task)')
+    expect(describeItems([])).toBe('(the checklist is empty)')
+  })
+
+  test('merge keeps the first id with the new wording and removes the rest', async () => {
+    const result = applyChecklistOp(list, { action: 'merge', ids: [1, 2], text: 'Add postal address to upgrade emails' })
+    if ('error' in result) throw new Error(result.error)
+    expect(result.list.items.map(item => [item.id, item.text])).toEqual([
+      [1, 'Add postal address to upgrade emails'],
+      [3, 'Merge PR #2309'],
+      [4, 'Fix login'],
+    ])
+    expect(result.summary).toBe('Merged #1, #2 into #1.')
+  })
+
+  test('tick, reopen, edit, drop and add each change only what they name', async () => {
+    const ticked = applyChecklistOp(list, { action: 'tick', ids: [3] })
+    if ('error' in ticked) throw new Error(ticked.error)
+    expect(ticked.list.items[2]).toEqual({ ...list.items[2], status: 'completed', ticked: false })
+    const reopened = applyChecklistOp(list, { action: 'reopen', ids: [4] })
+    if ('error' in reopened) throw new Error(reopened.error)
+    expect(reopened.list.items[3]?.status).toBe('pending')
+    const edited = applyChecklistOp(list, { action: 'edit', id: 3, text: 'Merge #2309 to production' })
+    if ('error' in edited) throw new Error(edited.error)
+    expect(edited.list.items[2]?.text).toBe('Merge #2309 to production')
+    const dropped = applyChecklistOp(list, { action: 'drop', ids: [2, 3] })
+    if ('error' in dropped) throw new Error(dropped.error)
+    expect(dropped.list.items.map(item => item.id)).toEqual([1, 4])
+    const added = applyChecklistOp(list, { action: 'add', text: 'Renew the push certificate' })
+    if ('error' in added) throw new Error(added.error)
+    expect(added.list.items.at(-1)).toEqual({ id: 5, text: 'Renew the push certificate', source: 'followup', status: 'pending', ticked: false })
+  })
+
+  test('an unknown number is reported, never guessed at', async () => {
+    expect(applyChecklistOp(list, { action: 'tick', ids: [3, 9] })).toEqual({ error: 'No item #9 on the checklist. Call list to see the numbers.' })
   })
 })

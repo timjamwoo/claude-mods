@@ -765,6 +765,48 @@ test('the session title from the classic hooks names the session on the board, a
   expect(world.boardFile('sess-B')?.title).toBe('Concairge')
 })
 
+test('Claude gets a checklist tool that lists, merges and ticks the items, and the pane follows', async ($, on) => {
+  const world = fakeWorld(on)
+  const registered: { name: string; description: string; isDeferred?: unknown }[] = []
+  on('tool.register', (_, e) => {
+    registered.push(e)
+    return { value: { tool: `mcp__cc-board__${e.name}` } }
+  })
+  await $.session.start({ cwd: '/work/my-app', surface: 'desktop', isInteractive: true })
+  expect(registered.map(tool => [tool.name, tool.isDeferred])).toEqual([['checklist', false]])
+  expect(registered[0]?.description).toContain('only when the user asks')
+  for (const step of ['Add a postal address to the upgrade email', 'Add a postal address to the welcome email', 'Merge PR #2309']) {
+    await $.command.run({ command: 'manual', args: step, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  }
+
+  const listed = await $.tool.call({ tool: 'mcp__cc-board__checklist', action: 'list' })
+  expect(listed.result).toBe('#1 [open] Add a postal address to the upgrade email (manual step)\n#2 [open] Add a postal address to the welcome email (manual step)\n#3 [open] Merge PR #2309 (manual step)')
+
+  const merged = await $.tool.call({ tool: 'mcp__cc-board__checklist', action: 'merge', ids: [1, 2], text: 'Add postal address to both emails' })
+  expect(String(merged.result)).toContain('Merged #1, #2 into #1.')
+  const ticked = await $.tool.call({ tool: 'mcp__cc-board__checklist', action: 'tick', ids: [3] })
+  expect(String(ticked.result)).toBe('Ticked #3.\nOpen now:\n#1 [open] Add postal address to both emails (manual step)')
+  expect(world.boardFile('sess-A')?.items.map(item => [item.id, item.text, item.status])).toEqual([
+    [1, 'Add postal address to both emails', 'pending'],
+    [3, 'Merge PR #2309', 'completed'],
+  ])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'item-1' }))?.props.label).toBe('[ ] #1 Add postal address to both emails (manual)')
+  expect(await ui.find({ key: 'item-2' })).toBeUndefined()
+  await ui.unmount()
+
+  // A bad number or a malformed call comes back as an error Claude can read, and changes nothing.
+  const wrong = await $.tool.call({ tool: 'mcp__cc-board__checklist', action: 'drop', ids: [7] })
+  expect(wrong.isError).toBe(true)
+  expect(String(wrong.result)).toContain('No item #7')
+  expect(world.boardFile('sess-A')?.items.length).toBe(2)
+  // Claude's own edits are not echoed back to it as a note.
+  await world.clock.advance(300)
+  expect(world.lastNote()).toContain('steps they will do themselves')
+  expect(world.lastNote()).not.toContain('Merged')
+})
+
 test('the copy button and /board copy put the shown items on the clipboard as Markdown', async ($, on) => {
   const world = fakeWorld(on)
   on('session.surfaces', () => ({ value: ['desktop'] }))

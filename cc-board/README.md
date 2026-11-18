@@ -30,6 +30,15 @@ shows no longer relevant (superseded, reverted, decided against) is
 dropped. Claude is told nothing about any of this. Turn it all off with
 the `autoDone` option.
 
+**Claude can work with the list when you ask.** The mod gives Claude a
+`checklist` tool, so you can say "tackle item 3", "consolidate the to-do
+list" or "tick off the key rotation". Claude can list the items with their
+numbers, tick or reopen them, reword one, merge several into one, drop
+some, or add one. Each change shows in the pane at once. The tool's
+description tells Claude to use it only when you ask about the list, or to
+tick an item it has just finished at your request, so the list never steers
+its work by itself. Subagents cannot change it.
+
 **Loose ends get surfaced.** The real point of the checklist is the small
 things said in passing and then forgotten: "you'll need to rotate the key
 later", "I've skipped the store listing for now", "oh, and remind me to
